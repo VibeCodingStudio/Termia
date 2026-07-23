@@ -1,0 +1,45 @@
+{
+  "name": "@vibecodingstudio/termia",
+  "version": "0.1.0",
+  "description": "A Pi-native persistent terminal with command history and managed nested SSH workspaces.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "terminal",
+    "ssh",
+    "shell",
+    "agent"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/VibeCodingStudio/Termia#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VibeCodingStudio/Termia.git"
+  },
+  "bugs": {
+    "url": "https://github.com/VibeCodingStudio/Termia/issues"
+  },
+  "type": "module",
+  "files": ["extensions", "README.md", "LICENSE"],
+  "engines": { "node": ">=22.19.0" },
+  "pi": { "extensions": ["./extensions/termia/index.ts"] },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": { "node-pty": "1.2.0-beta.13", "typebox": "1.1.38" },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3"
+  }
+}

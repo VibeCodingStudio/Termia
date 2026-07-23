@@ -1,0 +1,44 @@
+services:
+  keygen:
+    build: .
+    user: "${TERMIA_TEST_UID:-1000}:${TERMIA_TEST_GID:-1000}"
+    environment:
+      TERMIA_ROLE: keygen
+    volumes:
+      - ./generated:/generated
+
+  host-a:
+    build: .
+    environment:
+      TERMIA_ROLE: host-a
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1::22"
+    volumes:
+      - ./generated:/generated:ro
+      - public-keys:/public-keys
+
+  host-b:
+    build: .
+    environment:
+      TERMIA_ROLE: host-b
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+    volumes:
+      - public-keys:/public-keys
+
+  host-c:
+    build: .
+    environment:
+      TERMIA_ROLE: host-c
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+    volumes:
+      - public-keys:/public-keys
+
+volumes:
+  public-keys:

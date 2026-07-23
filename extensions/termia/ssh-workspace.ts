@@ -48,6 +48,20 @@ function wrapRemote(parent: SshHop, command: string): string {
   return `ssh -S ${quote(parent.controlPath)} ${quote(parent.destination)} ${quote(`exec ${command}`)}`;
 }
 
+export function buildRemoteExecCommand(hops: readonly SshHop[], remoteCommand: string): string {
+  const leaf = hops.at(-1);
+  if (leaf === undefined) throw new Error("Cannot execute without an SSH hop");
+  validateField("remote command", remoteCommand);
+  for (const hop of hops) validateHop(hop);
+  let command = `ssh -S ${quote(leaf.controlPath)} ${quote(leaf.destination)} ${quote(`exec ${remoteCommand}`)}`;
+  for (let index = hops.length - 2; index >= 0; index -= 1) {
+    const parent = hops[index];
+    if (parent === undefined) throw new Error("Invalid SSH hop chain");
+    command = wrapRemote(parent, command);
+  }
+  return command;
+}
+
 export function buildSftpBridgeScript(hops: readonly SshHop[]): string {
   const leaf = hops.at(-1);
   if (leaf === undefined) throw new Error("Cannot build an SFTP bridge without an SSH hop");
@@ -388,6 +402,25 @@ export class SshChain {
       workspaceUri: workspaceUri(target),
       hopChain: states.map((state) => state.hop.destination),
     };
+  }
+
+  async signalProcessGroup(
+    shellId: string,
+    processGroupId: number,
+    signal: "INT" | "KILL",
+  ): Promise<void> {
+    if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) {
+      throw new Error("Invalid Agent process group");
+    }
+    if (signal !== "INT" && signal !== "KILL") throw new Error("Invalid Agent signal");
+    const index = this.hops.findIndex((state) => state.hop.shellId === shellId);
+    if (index < 0) throw new Error(`Unknown SSH shell: ${shellId}`);
+    const hops = this.hops.slice(0, index + 1).map((state) => state.hop);
+    await runFile(
+      "/bin/sh",
+      ["-c", buildRemoteExecCommand(hops, `kill -${signal} -${processGroupId}`)],
+      STOP_TIMEOUT_MS,
+    );
   }
 
   isHealthy(binding: WorkspaceBinding): boolean {

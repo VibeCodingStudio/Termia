@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SshOpenEvent } from "../extensions/termia/protocol.ts";
 import {
+  buildRemoteExecCommand,
   buildSftpBridgeScript,
   SshChain,
   workspaceMountName,
@@ -88,6 +89,24 @@ test("builds an SFTP relay through control sockets owned by each parent", () => 
   assert.match(script, /host-b/);
   assert.match(script, /-s .*sftp/);
   assert.doesNotMatch(script, /IdentityFile|private.key|reconnect/);
+});
+
+test("builds nested process-group signals through existing control sockets", async () => {
+  const command = buildRemoteExecCommand(hops, "kill -INT -4123");
+  assert.match(command, /\/tmp\/termia-a\/control/);
+  assert.match(command, /host-a/);
+  assert.match(command, /\/tmp\/termia-b\/control/);
+  assert.match(command, /host-b/);
+  assert.match(command, /kill -INT -4123/);
+
+  const chain = new SshChain(fileWorkspace("/work/project"), "local", new FakeMounts());
+  chain.open(openA);
+  await assert.rejects(chain.signalProcessGroup("missing", 4123, "INT"), /Unknown SSH shell/);
+  await assert.rejects(chain.signalProcessGroup("shell-a", 0, "INT"), /Invalid Agent process group/);
+  await assert.rejects(
+    chain.signalProcessGroup("shell-a", 4123, "TERM" as "INT"),
+    /Invalid Agent signal/,
+  );
 });
 
 test("names mount directories by hop depth and leaf identity", () => {

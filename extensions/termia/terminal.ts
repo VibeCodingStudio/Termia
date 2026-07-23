@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -8,7 +9,7 @@ import type { CommandRecord } from "./history.ts";
 import { HistoryStore } from "./history.ts";
 import { ProtocolParser, type ProtocolToken, type QuickAskRequest } from "./protocol.ts";
 import { SshChain, type MountOperations } from "./ssh-workspace.ts";
-import { fileWorkspace, type WorkspaceBinding } from "./workspace.ts";
+import { fileWorkspace, projectWorkspacePath, type WorkspaceBinding } from "./workspace.ts";
 
 type TerminalContext = Pick<ExtensionCommandContext, "ui">;
 type CommandListener = (command: CommandRecord) => void;
@@ -26,6 +27,11 @@ export type ExecuteOptions = {
   onOutput?: (data: string) => void;
   signal?: AbortSignal;
 };
+export type AgentExecuteOptions = {
+  onOutput?: (data: Buffer) => void;
+  signal?: AbortSignal;
+};
+export type AgentExecutionResult = { exitCode: number };
 type ActiveExecution = {
   command: string;
   isolated: boolean;
@@ -37,6 +43,29 @@ type ActiveExecution = {
   abort: () => void;
   resolve: (record: CommandRecord) => void;
   reject: (error: Error) => void;
+};
+type AgentExecution = {
+  id: number;
+  shellId: string;
+  command: string;
+  processGroupId: number | undefined;
+  transcriptPath: Promise<string> | undefined;
+  transcriptOffset: number;
+  transcriptPump: Promise<void> | undefined;
+  status: "launching" | "running" | "waiting" | "foreground" | "ended";
+  launchWritten: boolean;
+  payloadWritten: boolean;
+  aborting: boolean;
+  killTimer: NodeJS.Timeout | undefined;
+  onOutput: ((data: Buffer) => void) | undefined;
+  signal: AbortSignal | undefined;
+  abort: () => void;
+  resolve: (result: AgentExecutionResult) => void;
+  reject: (error: Error) => void;
+};
+type AgentControl = {
+  run: () => boolean;
+  onReady: (() => void) | undefined;
 };
 
 const SHELL_DIRECTORY = resolve(dirname(fileURLToPath(import.meta.url)), "./shell");
@@ -83,6 +112,12 @@ export class TerminalController {
   private readonly promptBoundaries = new Map<string, PromptBoundary>();
   private readonly observedHistoryIds = new Map<string, number>();
   private readonly manualCommandStartedAt = new Map<string, number>();
+  private readonly agentExecutions = new Map<number, AgentExecution>();
+  private readonly agentControlQueue: AgentControl[] = [];
+  private nextAgentJobId = 1;
+  private agentPollTimer: NodeJS.Timeout | undefined;
+  private agentControlActive: AgentControl | undefined;
+  private agentControlMuted = false;
 
   constructor(history: HistoryStore, mounts?: MountOperations) {
     this.history = history;
@@ -211,6 +246,62 @@ export class TerminalController {
       this.execution = execution;
       execution.signal?.addEventListener("abort", abort, { once: true });
       if (this.shellReady) this.writeExecution(execution);
+    });
+  }
+
+  async executeAgent(
+    command: string,
+    options: AgentExecuteOptions = {},
+  ): Promise<AgentExecutionResult> {
+    if (command.trim().length === 0) throw new Error("Termia command cannot be empty");
+    if (command.includes("\u0000")) throw new Error("Termia command cannot contain NUL bytes");
+    if (this.pty === undefined) throw new Error("Termia shell is not running");
+    if (this.attached || this.activeQuickAsk !== undefined) {
+      throw new Error("Termia terminal is attached");
+    }
+
+    const id = this.nextAgentJobId++;
+    return new Promise((resolveExecution, rejectExecution) => {
+      const execution: AgentExecution = {
+        id,
+        shellId: this.activeShellId,
+        command,
+        processGroupId: undefined,
+        transcriptPath: undefined,
+        transcriptOffset: 0,
+        transcriptPump: undefined,
+        status: "launching",
+        launchWritten: false,
+        payloadWritten: false,
+        aborting: false,
+        killTimer: undefined,
+        onOutput: options.onOutput,
+        signal: options.signal,
+        abort: () => this.abortAgentExecution(execution),
+        resolve: resolveExecution,
+        reject: rejectExecution,
+      };
+      this.agentExecutions.set(id, execution);
+      execution.signal?.addEventListener("abort", execution.abort, { once: true });
+      this.enqueueAgentControl({
+        run: () => {
+          if (!this.agentExecutions.has(id)) return false;
+          execution.launchWritten = true;
+          this.pty?.write(`__termia_agent_stream ${id}\r`);
+          return true;
+        },
+        onReady: () => {
+          if (!this.agentExecutions.has(id) || execution.processGroupId !== undefined) return;
+          this.finishAgentExecutionBeforeStart(
+            execution,
+            execution.aborting
+              ? new Error("Termia Agent command was aborted before execution")
+              : new Error("Termia Agent command failed to start"),
+          );
+        },
+      });
+      this.scheduleAgentPoll();
+      if (execution.signal?.aborted) execution.abort();
     });
   }
 
@@ -356,6 +447,189 @@ export class TerminalController {
     await this.sshChain.dispose();
   }
 
+  private enqueueAgentControl(control: AgentControl): void {
+    this.agentControlQueue.push(control);
+    this.flushAgentControl();
+  }
+
+  private flushAgentControl(): void {
+    if (
+      this.pty === undefined
+      || !this.shellReady
+      || this.agentControlMuted
+      || this.execution !== undefined
+      || this.attached
+      || this.activeQuickAsk !== undefined
+    ) return;
+    for (;;) {
+      const control = this.agentControlQueue.shift();
+      if (control === undefined) return;
+      this.agentControlMuted = true;
+      this.agentControlActive = control;
+      this.shellReady = false;
+      if (control.run()) return;
+      this.agentControlMuted = false;
+      this.agentControlActive = undefined;
+      this.shellReady = true;
+    }
+  }
+
+  private scheduleAgentPoll(): void {
+    if (this.agentPollTimer !== undefined || this.agentExecutions.size === 0) return;
+    this.agentPollTimer = setTimeout(() => {
+      this.agentPollTimer = undefined;
+      for (const execution of this.agentExecutions.values()) {
+        void this.pumpAgentTranscript(execution, false).catch(() => {});
+      }
+      if (this.agentExecutions.size === 0) return;
+      this.enqueueAgentControl({
+        run: () => {
+          if (this.agentExecutions.size === 0) return false;
+          this.pty?.write("__termia_agent_poll\r");
+          return true;
+        },
+        onReady: () => this.scheduleAgentPoll(),
+      });
+    }, 50);
+  }
+
+  private async pumpAgentTranscript(execution: AgentExecution, final: boolean): Promise<void> {
+    const transcriptPath = execution.transcriptPath;
+    if (transcriptPath === undefined) return;
+    if (execution.transcriptPump !== undefined) {
+      if (!final) return;
+      await execution.transcriptPump;
+    }
+    const pump = (async () => {
+      const path = await transcriptPath;
+      let handle;
+      try {
+        handle = await open(path, "r");
+        const size = (await handle.stat()).size;
+        if (size <= execution.transcriptOffset) return;
+        const data = Buffer.allocUnsafe(size - execution.transcriptOffset);
+        const { bytesRead } = await handle.read(
+          data,
+          0,
+          data.length,
+          execution.transcriptOffset,
+        );
+        execution.transcriptOffset += bytesRead;
+        if (bytesRead > 0) execution.onOutput?.(data.subarray(0, bytesRead));
+      } catch (error) {
+        if (!final && (error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      } finally {
+        await handle?.close();
+      }
+    })();
+    execution.transcriptPump = pump;
+    try {
+      await pump;
+    } finally {
+      if (execution.transcriptPump === pump) execution.transcriptPump = undefined;
+    }
+  }
+
+  private abortAgentExecution(execution: AgentExecution): void {
+    if (!this.agentExecutions.has(execution.id) || execution.aborting) return;
+    execution.aborting = true;
+    if (!execution.launchWritten) {
+      this.finishAgentExecutionBeforeStart(
+        execution,
+        new Error("Termia Agent command was aborted before execution"),
+      );
+      return;
+    }
+    if (!execution.payloadWritten) return;
+    if (execution.processGroupId === undefined) {
+      this.pty?.write("\u0003");
+      return;
+    }
+    void this.signalAgentExecution(execution, "INT").catch(() => {});
+    execution.killTimer = setTimeout(() => {
+      if (!this.agentExecutions.has(execution.id)) return;
+      void this.signalAgentExecution(execution, "KILL").catch(() => {});
+    }, 500);
+  }
+
+  private async signalAgentExecution(
+    execution: AgentExecution,
+    signal: "INT" | "KILL",
+  ): Promise<void> {
+    const processGroupId = execution.processGroupId;
+    if (processGroupId === undefined) return;
+    try {
+      if (this.sshChain.contextFor(execution.shellId).hopChain.length === 0) {
+        process.kill(-processGroupId, signal === "INT" ? "SIGINT" : "SIGKILL");
+      } else {
+        await this.sshChain.signalProcessGroup(execution.shellId, processGroupId, signal);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+
+  private finishAgentExecutionBeforeStart(execution: AgentExecution, error: Error): void {
+    if (!this.agentExecutions.delete(execution.id)) return;
+    execution.status = "ended";
+    execution.signal?.removeEventListener("abort", execution.abort);
+    if (execution.killTimer !== undefined) clearTimeout(execution.killTimer);
+    execution.reject(error);
+    this.finishAgentControlLifecycle();
+  }
+
+  private async finishAgentExecution(execution: AgentExecution, exitCode: number): Promise<void> {
+    if (!this.agentExecutions.has(execution.id) || execution.status === "ended") return;
+    execution.status = "ended";
+    if (execution.killTimer !== undefined) clearTimeout(execution.killTimer);
+    try {
+      await this.pumpAgentTranscript(execution, true);
+    } catch (error) {
+      if (!this.agentExecutions.delete(execution.id)) return;
+      execution.signal?.removeEventListener("abort", execution.abort);
+      execution.reject(error instanceof Error ? error : new Error(String(error)));
+      this.finishAgentControlLifecycle();
+      return;
+    }
+    if (!this.agentExecutions.delete(execution.id)) return;
+    execution.signal?.removeEventListener("abort", execution.abort);
+    execution.resolve({ exitCode });
+    this.finishAgentControlLifecycle();
+  }
+
+  private finishAgentControlLifecycle(): void {
+    if (this.agentExecutions.size > 0) {
+      this.scheduleAgentPoll();
+      return;
+    }
+    if (this.agentPollTimer !== undefined) clearTimeout(this.agentPollTimer);
+    this.agentPollTimer = undefined;
+    this.enqueueAgentControl({
+      run: () => {
+        this.pty?.write("__termia_agent_cleanup\r");
+        return this.pty !== undefined;
+      },
+      onReady: undefined,
+    });
+  }
+
+  private failAgentExecutions(error: Error): void {
+    if (this.agentPollTimer !== undefined) clearTimeout(this.agentPollTimer);
+    this.agentPollTimer = undefined;
+    this.agentControlQueue.length = 0;
+    this.agentControlActive = undefined;
+    this.agentControlMuted = false;
+    for (const execution of this.agentExecutions.values()) {
+      execution.status = "ended";
+      execution.signal?.removeEventListener("abort", execution.abort);
+      if (execution.killTimer !== undefined) clearTimeout(execution.killTimer);
+      execution.onOutput = undefined;
+      execution.reject(error);
+    }
+    this.agentExecutions.clear();
+  }
+
   private consume(data: string): void {
     for (const token of this.parser.push(data)) this.consumeToken(token);
   }
@@ -363,6 +637,7 @@ export class TerminalController {
   private consumeToken(token: ProtocolToken): void {
     switch (token.type) {
       case "output":
+        if (this.agentControlMuted) break;
         this.history.appendOutput(token.data);
         if (this.execution?.sequence !== undefined) {
           this.execution.onOutput?.(token.data);
@@ -384,6 +659,12 @@ export class TerminalController {
         this.cwdValue = token.cwd;
         this.sshChain.updateCwd(token.shellId, token.cwd);
         this.shellReady = true;
+        if (this.agentControlMuted) {
+          const control = this.agentControlActive;
+          this.agentControlMuted = false;
+          this.agentControlActive = undefined;
+          control?.onReady?.();
+        }
         if (
           this.execution?.aborting
           && this.execution.sequence !== undefined
@@ -408,7 +689,74 @@ export class TerminalController {
         } else if (this.execution !== undefined && !this.execution.written) {
           this.writeExecution(this.execution);
         }
+        this.flushAgentControl();
         break;
+      case "agentJobTransportReady": {
+        const execution = this.agentExecutions.get(token.jobId);
+        if (
+          execution === undefined
+          || execution.shellId !== token.shellId
+          || !execution.launchWritten
+          || execution.payloadWritten
+        ) break;
+        execution.payloadWritten = true;
+        if (execution.aborting) {
+          this.pty?.write("%\r");
+          break;
+        }
+        const encoded = Buffer.from(execution.command, "utf8").toString("base64");
+        for (let offset = 0; offset < encoded.length; offset += EXPLICIT_EXEC_CHUNK_SIZE) {
+          this.pty?.write(`${encoded.slice(offset, offset + EXPLICIT_EXEC_CHUNK_SIZE)}\r`);
+        }
+        this.pty?.write(".\r");
+        break;
+      }
+      case "agentJobStart": {
+        const execution = this.agentExecutions.get(token.jobId);
+        if (execution === undefined || execution.shellId !== token.shellId) break;
+        execution.processGroupId = token.processGroupId;
+        execution.status = "running";
+        execution.transcriptPath = this.sshChain.readyBinding(token.shellId).then((binding) =>
+          projectWorkspacePath(binding, token.transcriptPath)
+        );
+        void this.pumpAgentTranscript(execution, false).catch(() => {});
+        if (execution.aborting) {
+          void this.signalAgentExecution(execution, "INT").catch(() => {});
+          execution.killTimer = setTimeout(() => {
+            if (!this.agentExecutions.has(execution.id)) return;
+            void this.signalAgentExecution(execution, "KILL").catch(() => {});
+          }, 500);
+        }
+        break;
+      }
+      case "agentJobWaiting": {
+        const execution = this.agentExecutions.get(token.jobId);
+        if (execution !== undefined && execution.shellId === token.shellId) {
+          execution.status = "waiting";
+        }
+        break;
+      }
+      case "agentJobForeground": {
+        const execution = this.agentExecutions.get(token.jobId);
+        if (execution !== undefined && execution.shellId === token.shellId) {
+          execution.status = "foreground";
+        }
+        break;
+      }
+      case "agentJobBackground": {
+        const execution = this.agentExecutions.get(token.jobId);
+        if (execution !== undefined && execution.shellId === token.shellId) {
+          execution.status = "running";
+        }
+        break;
+      }
+      case "agentJobEnd": {
+        const execution = this.agentExecutions.get(token.jobId);
+        if (execution !== undefined && execution.shellId === token.shellId) {
+          void this.finishAgentExecution(execution, token.exitCode);
+        }
+        break;
+      }
       case "start":
         this.activeShellId = token.shellId;
         this.shellReady = false;
@@ -517,6 +865,7 @@ export class TerminalController {
     this.manualCommandStartedAt.clear();
     this.history.endTerminal();
     void this.sshChain.dispose();
+    this.failAgentExecutions(new Error("Termia shell exited while an Agent command was running"));
     const execution = this.execution;
     if (execution !== undefined) {
       this.clearExecution(execution);

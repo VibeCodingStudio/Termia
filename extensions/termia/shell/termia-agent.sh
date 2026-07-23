@@ -11,6 +11,7 @@ __termia_agent_init() {
   umask 077
   command mkdir -p "$__termia_agent_root"
   __termia_agent_status=$?
+  [ "$__termia_agent_status" -ne 0 ] || : >>"$__termia_agent_root/jobs"
   umask "$__termia_agent_old_umask"
   [ "$__termia_agent_status" -eq 0 ] || return 1
   if [ -z "$__termia_agent_tty_mode" ]; then
@@ -32,10 +33,13 @@ __termia_agent_process_state() {
 }
 
 __termia_agent_restore_tty() {
-  local __termia_agent_dir
-  for __termia_agent_dir in "$__termia_agent_root"/[0-9]*; do
-    [ -f "$__termia_agent_dir/pid" ] && return
-  done
+  local __termia_agent_dir __termia_agent_id
+  if [ -f "$__termia_agent_root/jobs" ]; then
+    while IFS= read -r __termia_agent_id; do
+      __termia_agent_dir=$__termia_agent_root/$__termia_agent_id
+      [ -f "$__termia_agent_dir/pid" ] && return
+    done <"$__termia_agent_root/jobs"
+  fi
   if [ -n "$__termia_agent_tty_mode" ]; then
     command stty "$__termia_agent_tty_mode" </dev/tty >/dev/null 2>&1 || :
     __termia_agent_tty_mode=
@@ -74,6 +78,7 @@ __termia_agent_stream() {
   __termia_agent_init || return 1
   __termia_agent_dir=$__termia_agent_root/$__termia_agent_id
   command mkdir "$__termia_agent_dir" || return 1
+  printf '%s\n' "$__termia_agent_id" >>"$__termia_agent_root/jobs"
   (
     __termia_guard=1
     [ -z "${BASH_VERSION-}" ] || shopt -s expand_aliases
@@ -105,9 +110,10 @@ __termia_agent_poll() {
   local __termia_agent_state __termia_agent_previous __termia_agent_status
   local __termia_agent_cwd __termia_agent_shell_id
   __termia_agent_shell_id=$(printf '%s' "$TERMIA_SHELL_ID" | __termia_b64)
-  for __termia_agent_dir in "$__termia_agent_root"/[0-9]*; do
+  [ -f "$__termia_agent_root/jobs" ] || return
+  while IFS= read -r __termia_agent_id; do
+    __termia_agent_dir=$__termia_agent_root/$__termia_agent_id
     [ -d "$__termia_agent_dir" ] || continue
-    __termia_agent_id=${__termia_agent_dir##*/}
     __termia_agent_pid=$(command sed -n '1p' "$__termia_agent_dir/pid")
     case "$__termia_agent_pid" in ''|*[!0-9]*) continue ;; esac
     if [ -f "$__termia_agent_dir/status" ]; then
@@ -135,7 +141,7 @@ __termia_agent_poll() {
           || printf '%s\n' running >"$__termia_agent_dir/state"
         ;;
     esac
-  done
+  done <"$__termia_agent_root/jobs"
   __termia_agent_restore_tty
 }
 
@@ -164,13 +170,16 @@ __termia_agent_background() {
 }
 
 __termia_agent_cleanup() {
-  local __termia_agent_dir
-  for __termia_agent_dir in "$__termia_agent_root"/[0-9]*; do
+  local __termia_agent_dir __termia_agent_id
+  [ -f "$__termia_agent_root/jobs" ] || return
+  while IFS= read -r __termia_agent_id; do
+    __termia_agent_dir=$__termia_agent_root/$__termia_agent_id
     [ -d "$__termia_agent_dir" ] || continue
     command rm -f "$__termia_agent_dir/pid" "$__termia_agent_dir/job" \
       "$__termia_agent_dir/state" "$__termia_agent_dir/status" \
       "$__termia_agent_dir/cwd" "$__termia_agent_dir/output"
     command rmdir "$__termia_agent_dir" >/dev/null 2>&1 || :
-  done
+  done <"$__termia_agent_root/jobs"
+  command rm -f "$__termia_agent_root/jobs"
   __termia_agent_restore_tty
 }

@@ -89,7 +89,9 @@ __termia_agent_stream() {
     exit "$__termia_agent_status"
   ) >"$__termia_agent_dir/output" 2>&1 </dev/tty &
   __termia_agent_pid=$!
-  __termia_agent_job_line=$(jobs -l %+ 2>/dev/null | command sed -n '1p')
+  __termia_agent_job_line=$(jobs -l 2>/dev/null \
+    | command sed -n "/^[^[]*\[[0-9][0-9]*\][^0-9]*$__termia_agent_pid[[:space:]]/p" \
+    | command sed -n '1p')
   __termia_agent_job_number=$(printf '%s' "$__termia_agent_job_line" \
     | command sed 's/^[^[]*\[\([0-9][0-9]*\)\].*$/\1/')
   case "$__termia_agent_job_number" in

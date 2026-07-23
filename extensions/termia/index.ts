@@ -667,6 +667,7 @@ export default function termia(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     if (isTermiaPty()) return;
     const state = runtime();
+    state.terminal.setUi(ctx.ui);
     state.editorFactory = installBangEditor(
       ctx.ui,
       state.editorFactory,
@@ -827,6 +828,7 @@ export default function termia(pi: ExtensionAPI): void {
     const state = globalThis.__termiaPiRuntime;
     if (state === undefined) return;
     try {
+      state.terminal.setUi(undefined);
       state.terminal.dispose();
     } finally {
       state.history.close();

@@ -3,8 +3,9 @@ import { realpathSync, statSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type IDisposable, type IPty } from "node-pty";
+import { AgentJobSelector, AgentJobSelectorModel, type AgentJobView } from "./agent-job-ui.ts";
 import type { CommandRecord } from "./history.ts";
 import { HistoryStore } from "./history.ts";
 import { ProtocolParser, type ProtocolToken, type QuickAskRequest } from "./protocol.ts";
@@ -48,9 +49,12 @@ type AgentExecution = {
   id: number;
   shellId: string;
   command: string;
+  cwd: string;
+  startedAt: number;
   processGroupId: number | undefined;
   transcriptPath: Promise<string> | undefined;
   transcriptOffset: number;
+  screenOffset: number;
   transcriptPump: Promise<void> | undefined;
   status: "launching" | "running" | "waiting" | "foreground" | "ended";
   launchWritten: boolean;
@@ -66,6 +70,7 @@ type AgentExecution = {
 type AgentControl = {
   run: () => boolean;
   onReady: (() => void) | undefined;
+  onCancel?: () => void;
 };
 
 const SHELL_DIRECTORY = resolve(dirname(fileURLToPath(import.meta.url)), "./shell");
@@ -116,8 +121,16 @@ export class TerminalController {
   private readonly agentControlQueue: AgentControl[] = [];
   private nextAgentJobId = 1;
   private agentPollTimer: NodeJS.Timeout | undefined;
+  private agentTranscriptTimer: NodeJS.Timeout | undefined;
   private agentControlActive: AgentControl | undefined;
   private agentControlMuted = false;
+  private ui: ExtensionUIContext | undefined;
+  private agentInteraction: Promise<void> | undefined;
+  private agentInteractionTimer: NodeJS.Timeout | undefined;
+  private activeAgentForeground: AgentExecution | undefined;
+  private agentScreenWrite: ((data: Buffer) => void) | undefined;
+  private agentRawFinish: (() => void) | undefined;
+  private agentSelectorFinish: (() => void) | undefined;
 
   constructor(history: HistoryStore, mounts?: MountOperations) {
     this.history = history;
@@ -266,9 +279,12 @@ export class TerminalController {
         id,
         shellId: this.activeShellId,
         command,
+        cwd: this.cwdValue,
+        startedAt: Date.now(),
         processGroupId: undefined,
         transcriptPath: undefined,
         transcriptOffset: 0,
+        screenOffset: 0,
         transcriptPump: undefined,
         status: "launching",
         launchWritten: false,
@@ -301,6 +317,7 @@ export class TerminalController {
         },
       });
       this.scheduleAgentPoll();
+      this.startAgentTranscriptPump();
       if (execution.signal?.aborted) execution.abort();
     });
   }
@@ -321,6 +338,15 @@ export class TerminalController {
   onQuickAsk(listener: QuickAskListener): () => void {
     this.quickAskListeners.add(listener);
     return () => this.quickAskListeners.delete(listener);
+  }
+
+  setUi(ui: ExtensionUIContext | undefined): void {
+    this.ui = ui;
+    if (ui === undefined) {
+      this.agentSelectorFinish?.();
+      this.agentRawFinish?.();
+    }
+    else this.scheduleAgentInteraction();
   }
 
   completeQuickAsk(exitCode: number, output = ""): void {
@@ -474,13 +500,19 @@ export class TerminalController {
     }
   }
 
+  private startAgentTranscriptPump(): void {
+    if (this.agentTranscriptTimer !== undefined) return;
+    this.agentTranscriptTimer = setInterval(() => {
+      for (const execution of this.agentExecutions.values()) {
+        void this.pumpAgentTranscript(execution, false).catch(() => {});
+      }
+    }, 50);
+  }
+
   private scheduleAgentPoll(): void {
     if (this.agentPollTimer !== undefined || this.agentExecutions.size === 0) return;
     this.agentPollTimer = setTimeout(() => {
       this.agentPollTimer = undefined;
-      for (const execution of this.agentExecutions.values()) {
-        void this.pumpAgentTranscript(execution, false).catch(() => {});
-      }
       if (this.agentExecutions.size === 0) return;
       this.enqueueAgentControl({
         run: () => {
@@ -507,15 +539,31 @@ export class TerminalController {
         handle = await open(path, "r");
         const size = (await handle.stat()).size;
         if (size <= execution.transcriptOffset) return;
-        const data = Buffer.allocUnsafe(size - execution.transcriptOffset);
+        const offset = execution.transcriptOffset;
+        const data = Buffer.allocUnsafe(size - offset);
         const { bytesRead } = await handle.read(
           data,
           0,
           data.length,
-          execution.transcriptOffset,
+          offset,
         );
         execution.transcriptOffset += bytesRead;
-        if (bytesRead > 0) execution.onOutput?.(data.subarray(0, bytesRead));
+        if (bytesRead > 0) {
+          const output = data.subarray(0, bytesRead);
+          execution.onOutput?.(output);
+          if (
+            this.activeAgentForeground === execution
+            && execution.status === "foreground"
+            && this.agentScreenWrite !== undefined
+          ) {
+            const screenStart = Math.max(execution.screenOffset, offset);
+            const screenEnd = offset + bytesRead;
+            if (screenStart < screenEnd) {
+              this.agentScreenWrite(output.subarray(screenStart - offset));
+              execution.screenOffset = screenEnd;
+            }
+          }
+        }
       } catch (error) {
         if (!final && (error as NodeJS.ErrnoException).code === "ENOENT") return;
         throw error;
@@ -528,6 +576,165 @@ export class TerminalController {
       await pump;
     } finally {
       if (execution.transcriptPump === pump) execution.transcriptPump = undefined;
+    }
+  }
+
+  private async readAgentScreenTranscript(execution: AgentExecution): Promise<Buffer> {
+    await this.pumpAgentTranscript(execution, false);
+    const transcriptPath = execution.transcriptPath;
+    const end = execution.transcriptOffset;
+    if (transcriptPath === undefined || end <= execution.screenOffset) return Buffer.alloc(0);
+    const handle = await open(await transcriptPath, "r");
+    try {
+      const data = Buffer.allocUnsafe(end - execution.screenOffset);
+      const { bytesRead } = await handle.read(data, 0, data.length, execution.screenOffset);
+      execution.screenOffset += bytesRead;
+      return data.subarray(0, bytesRead);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private runAgentControl(command: string): Promise<void> {
+    return new Promise((resolveControl) => {
+      this.enqueueAgentControl({
+        run: () => {
+          if (this.pty === undefined) {
+            resolveControl();
+            return false;
+          }
+          this.pty.write(`${command}\r`);
+          return true;
+        },
+        onReady: resolveControl,
+        onCancel: resolveControl,
+      });
+    });
+  }
+
+  private waitingAgentJobs(): AgentExecution[] {
+    return [...this.agentExecutions.values()].filter((execution) => execution.status === "waiting");
+  }
+
+  private scheduleAgentInteraction(): void {
+    if (
+      this.agentInteraction !== undefined
+      || this.agentInteractionTimer !== undefined
+      || this.ui === undefined
+      || this.waitingAgentJobs().length === 0
+    ) return;
+    this.agentInteractionTimer = setTimeout(() => {
+      this.agentInteractionTimer = undefined;
+      if (this.agentInteraction !== undefined || this.ui === undefined) return;
+      if (this.waitingAgentJobs().length === 0) return;
+      const interaction = this.runAgentInteraction();
+      this.agentInteraction = interaction;
+      const finish = () => {
+        if (this.agentInteraction === interaction) this.agentInteraction = undefined;
+        this.scheduleAgentInteraction();
+      };
+      void interaction.then(finish, finish);
+    }, 20);
+  }
+
+  private async runAgentInteraction(): Promise<void> {
+    const ui = this.ui;
+    if (ui === undefined || !process.stdin.isTTY || !process.stdout.isTTY) return;
+    const waiting = this.waitingAgentJobs();
+    let jobId = waiting[0]?.id;
+    if (waiting.length > 1) {
+      const views: AgentJobView[] = waiting.map((execution) => ({
+        id: execution.id,
+        command: execution.command,
+        cwd: execution.cwd,
+        startedAt: execution.startedAt,
+        status: "waiting",
+      }));
+      jobId = await ui.custom<number>(
+        (_tui, theme, _keys, done) => {
+          const finish = (selected: number) => {
+            if (this.agentSelectorFinish === cancel) this.agentSelectorFinish = undefined;
+            done(selected);
+          };
+          const cancel = () => finish(-1);
+          this.agentSelectorFinish = cancel;
+          return new AgentJobSelector(new AgentJobSelectorModel(views), theme, finish);
+        },
+        {
+          overlay: true,
+          overlayOptions: { width: "80%", minWidth: 48, maxHeight: "80%" },
+        },
+      );
+    }
+    const execution = jobId === undefined ? undefined : this.agentExecutions.get(jobId);
+    if (execution === undefined || execution.status !== "waiting") return;
+    const initialOutput = await this.readAgentScreenTranscript(execution);
+    let menuRequested = false;
+    let rawStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolveStarted) => {
+      rawStarted = resolveStarted;
+    });
+    this.activeAgentForeground = execution;
+    const raw = ui.custom<void>((tui, _theme, _keys, done) => {
+      const previousRawMode = process.stdin.isRaw;
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (this.agentRawFinish === finish) this.agentRawFinish = undefined;
+        this.agentScreenWrite = undefined;
+        process.stdin.off("data", onInput);
+        try {
+          process.stdin.setRawMode(previousRawMode);
+        } finally {
+          tui.start();
+          tui.requestRender(true);
+          done();
+        }
+      };
+      const onInput = (chunk: Buffer | string) => {
+        const data = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        const forwarded: number[] = [];
+        for (const byte of data) {
+          if (byte === 0x1d) continue;
+          if (byte === 0x07) {
+            if (forwarded.length > 0) this.pty?.write(Buffer.from(forwarded));
+            menuRequested = true;
+            this.pty?.write("\u001a");
+            return;
+          }
+          forwarded.push(byte);
+        }
+        if (forwarded.length > 0) this.pty?.write(Buffer.from(forwarded));
+      };
+      try {
+        tui.stop();
+        process.stdin.setRawMode(true);
+        process.stdin.on("data", onInput);
+        process.stdin.resume();
+        if (initialOutput.length > 0) process.stdout.write(initialOutput);
+        this.agentScreenWrite = (data) => process.stdout.write(data);
+        this.agentRawFinish = finish;
+        rawStarted?.();
+      } catch (error) {
+        finish();
+        throw error;
+      }
+      return { render: () => [], invalidate: () => {}, dispose: finish };
+    });
+    await started;
+    const foreground = this.runAgentControl(`__termia_agent_foreground ${execution.id}`);
+    void foreground.then(
+      () => this.agentRawFinish?.(),
+      () => this.agentRawFinish?.(),
+    );
+    await raw;
+    await foreground;
+    if (this.activeAgentForeground === execution) this.activeAgentForeground = undefined;
+    if (menuRequested && this.agentExecutions.has(execution.id)) {
+      execution.status = "running";
+      await this.runAgentControl(`__termia_agent_background ${execution.id}`);
+      if (this.agentExecutions.has(execution.id)) execution.status = "waiting";
     }
   }
 
@@ -605,6 +812,11 @@ export class TerminalController {
     }
     if (this.agentPollTimer !== undefined) clearTimeout(this.agentPollTimer);
     this.agentPollTimer = undefined;
+    if (this.agentTranscriptTimer !== undefined) clearInterval(this.agentTranscriptTimer);
+    this.agentTranscriptTimer = undefined;
+    if (this.agentInteractionTimer !== undefined) clearTimeout(this.agentInteractionTimer);
+    this.agentInteractionTimer = undefined;
+    this.agentSelectorFinish?.();
     this.enqueueAgentControl({
       run: () => {
         this.pty?.write("__termia_agent_cleanup\r");
@@ -617,9 +829,21 @@ export class TerminalController {
   private failAgentExecutions(error: Error): void {
     if (this.agentPollTimer !== undefined) clearTimeout(this.agentPollTimer);
     this.agentPollTimer = undefined;
+    if (this.agentTranscriptTimer !== undefined) clearInterval(this.agentTranscriptTimer);
+    this.agentTranscriptTimer = undefined;
+    if (this.agentInteractionTimer !== undefined) clearTimeout(this.agentInteractionTimer);
+    this.agentInteractionTimer = undefined;
+    this.agentControlActive?.onCancel?.();
+    for (const control of this.agentControlQueue) control.onCancel?.();
     this.agentControlQueue.length = 0;
     this.agentControlActive = undefined;
     this.agentControlMuted = false;
+    this.agentRawFinish?.();
+    this.agentSelectorFinish?.();
+    this.agentSelectorFinish = undefined;
+    this.agentRawFinish = undefined;
+    this.agentScreenWrite = undefined;
+    this.activeAgentForeground = undefined;
     for (const execution of this.agentExecutions.values()) {
       execution.status = "ended";
       execution.signal?.removeEventListener("abort", execution.abort);
@@ -637,6 +861,15 @@ export class TerminalController {
   private consumeToken(token: ProtocolToken): void {
     switch (token.type) {
       case "output":
+        if (
+          this.activeAgentForeground !== undefined
+          && this.activeAgentForeground.status === "foreground"
+        ) {
+          const output = Buffer.from(token.data);
+          this.activeAgentForeground.onOutput?.(output);
+          this.agentScreenWrite?.(output);
+          break;
+        }
         if (this.agentControlMuted) break;
         this.history.appendOutput(token.data);
         if (this.execution?.sequence !== undefined) {
@@ -733,6 +966,7 @@ export class TerminalController {
         const execution = this.agentExecutions.get(token.jobId);
         if (execution !== undefined && execution.shellId === token.shellId) {
           execution.status = "waiting";
+          this.scheduleAgentInteraction();
         }
         break;
       }
@@ -740,6 +974,7 @@ export class TerminalController {
         const execution = this.agentExecutions.get(token.jobId);
         if (execution !== undefined && execution.shellId === token.shellId) {
           execution.status = "foreground";
+          this.activeAgentForeground = execution;
         }
         break;
       }
@@ -747,12 +982,14 @@ export class TerminalController {
         const execution = this.agentExecutions.get(token.jobId);
         if (execution !== undefined && execution.shellId === token.shellId) {
           execution.status = "running";
+          if (this.activeAgentForeground === execution) this.agentRawFinish?.();
         }
         break;
       }
       case "agentJobEnd": {
         const execution = this.agentExecutions.get(token.jobId);
         if (execution !== undefined && execution.shellId === token.shellId) {
+          if (this.activeAgentForeground === execution) this.agentRawFinish?.();
           void this.finishAgentExecution(execution, token.exitCode);
         }
         break;

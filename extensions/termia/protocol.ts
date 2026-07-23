@@ -41,6 +41,36 @@ export type SshOpenEvent = {
   cwd: string;
 };
 export type SshCloseEvent = { type: "sshClose"; shellId: string };
+export type AgentJobStartEvent = {
+  type: "agentJobStart";
+  shellId: string;
+  jobId: number;
+  processGroupId: number;
+  cwd: string;
+  transcriptPath: string;
+};
+export type AgentJobWaitingEvent = {
+  type: "agentJobWaiting";
+  shellId: string;
+  jobId: number;
+};
+export type AgentJobForegroundEvent = {
+  type: "agentJobForeground";
+  shellId: string;
+  jobId: number;
+};
+export type AgentJobBackgroundEvent = {
+  type: "agentJobBackground";
+  shellId: string;
+  jobId: number;
+};
+export type AgentJobEndEvent = {
+  type: "agentJobEnd";
+  shellId: string;
+  jobId: number;
+  exitCode: number;
+  cwd: string;
+};
 export type ProtocolToken =
   | OutputToken
   | ReadyEvent
@@ -49,7 +79,12 @@ export type ProtocolToken =
   | CommandObservedEvent
   | QuickAskEvent
   | SshOpenEvent
-  | SshCloseEvent;
+  | SshCloseEvent
+  | AgentJobStartEvent
+  | AgentJobWaitingEvent
+  | AgentJobForegroundEvent
+  | AgentJobBackgroundEvent
+  | AgentJobEndEvent;
 
 const PREFIX = "\u001b]6973;";
 const END = "\u0007";
@@ -184,6 +219,51 @@ function parsePayload(payload: string): Exclude<ProtocolToken, OutputToken> | un
   if (kind === "L" && fields.length === 2) {
     const shellId = decodedText(fields[1]);
     return shellId === undefined ? undefined : { type: "sshClose", shellId };
+  }
+  if (kind === "A") {
+    const action = fields[1];
+    const shellId = decodedText(fields[2]);
+    const jobId = Number(fields[3]);
+    if (
+      shellId === undefined
+      || !Number.isSafeInteger(jobId)
+      || jobId < 0
+    ) return undefined;
+    if (action === "S" && fields.length === 7) {
+      const processGroupId = Number(fields[4]);
+      const cwd = decodedAbsolutePath(fields[5]);
+      const transcriptPath = decodedAbsolutePath(fields[6]);
+      if (
+        !Number.isSafeInteger(processGroupId)
+        || processGroupId <= 0
+        || cwd === undefined
+        || transcriptPath === undefined
+      ) return undefined;
+      return {
+        type: "agentJobStart",
+        shellId,
+        jobId,
+        processGroupId,
+        cwd,
+        transcriptPath,
+      };
+    }
+    if (fields.length === 4) {
+      if (action === "W") return { type: "agentJobWaiting", shellId, jobId };
+      if (action === "F") return { type: "agentJobForeground", shellId, jobId };
+      if (action === "B") return { type: "agentJobBackground", shellId, jobId };
+    }
+    if (action === "E" && fields.length === 6) {
+      const exitCode = Number(fields[4]);
+      const cwd = decodedAbsolutePath(fields[5]);
+      if (
+        !Number.isInteger(exitCode)
+        || exitCode < 0
+        || exitCode > 255
+        || cwd === undefined
+      ) return undefined;
+      return { type: "agentJobEnd", shellId, jobId, exitCode, cwd };
+    }
   }
   return undefined;
 }

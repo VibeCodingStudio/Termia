@@ -139,6 +139,44 @@ test("parses SSH hop open and close frames", () => {
   ]);
 });
 
+test("parses the Agent job lifecycle", () => {
+  const parser = new ProtocolParser();
+  const input = [
+    frame(`A;S;${b64("shell-a")};7;4123;${b64("/srv/app")};${b64("/tmp/termia-agent-shell-a/7/output")}`),
+    frame(`A;W;${b64("shell-a")};7`),
+    frame(`A;F;${b64("shell-a")};7`),
+    frame(`A;B;${b64("shell-a")};7`),
+    frame(`A;E;${b64("shell-a")};7;23;${b64("/srv/app/sub")}`),
+  ].join("");
+
+  assert.deepEqual(parser.push(input), [
+    {
+      type: "agentJobStart",
+      shellId: "shell-a",
+      jobId: 7,
+      processGroupId: 4123,
+      cwd: "/srv/app",
+      transcriptPath: "/tmp/termia-agent-shell-a/7/output",
+    },
+    { type: "agentJobWaiting", shellId: "shell-a", jobId: 7 },
+    { type: "agentJobForeground", shellId: "shell-a", jobId: 7 },
+    { type: "agentJobBackground", shellId: "shell-a", jobId: 7 },
+    { type: "agentJobEnd", shellId: "shell-a", jobId: 7, exitCode: 23, cwd: "/srv/app/sub" },
+  ]);
+});
+
+test("keeps malformed Agent job frames as output", () => {
+  const parser = new ProtocolParser();
+  for (const value of [
+    frame(`A;S;${b64("shell-a")};-1;4;${b64("/tmp")};${b64("/tmp/out")}`),
+    frame(`A;S;${b64("shell-a")};1;0;${b64("/tmp")};${b64("relative")}`),
+    frame(`A;E;${b64("shell-a")};1;999;${b64("/tmp")}`),
+    frame(`A;W;${b64("shell-a")};nope`),
+  ]) {
+    assert.deepEqual(parser.push(value), [{ type: "output", data: value }]);
+  }
+});
+
 test("keeps invalid SSH hop metadata as terminal output", () => {
   const parser = new ProtocolParser();
   const invalid = [

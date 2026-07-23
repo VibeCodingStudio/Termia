@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { SshOpenEvent } from "./protocol.ts";
 import {
   fileWorkspace,
@@ -140,12 +140,40 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+async function isMountPoint(path: string): Promise<boolean> {
+  try {
+    const [entry, parent] = await Promise.all([stat(path), stat(dirname(path))]);
+    return entry.dev !== parent.dev;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function waitForExit(child: ChildProcess, timeout: number): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await Promise.race([
     new Promise<void>((resolveExit) => child.once("exit", () => resolveExit())),
     delay(timeout),
   ]);
+}
+
+export async function prepareWorkspaceMountPath(path: string): Promise<void> {
+  try {
+    await mkdir(path, { mode: 0o700 });
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+
+  const command = process.platform === "darwin" ? "umount" : "fusermount3";
+  const args = process.platform === "darwin" ? ["-f", path] : ["-uz", path];
+  await runFile(command, args, STOP_TIMEOUT_MS).catch(() => {});
+  if (await isMountPoint(path)) {
+    throw new Error(`Termia SSH workspace remains mounted after takeover: ${path}`);
+  }
+  await rm(path, { recursive: true, force: true });
+  await mkdir(path, { mode: 0o700 });
 }
 
 export class WorkspaceMount implements MountOperations {
@@ -163,14 +191,7 @@ export class WorkspaceMount implements MountOperations {
     const bridgePath = join(runtimeRoot, `${workspaceMountName(hops)}.bridge`);
     const probePath = join(mountRoot, `.termia-probe-${leaf.shellId}`);
     await mkdir(WORKSPACE_ROOT, { recursive: true, mode: 0o700 });
-    try {
-      await mkdir(mountRoot, { mode: 0o700 });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new Error(`Termia SSH workspace is already in use: ${mountRoot}`, { cause: error });
-      }
-      throw error;
-    }
+    await prepareWorkspaceMountPath(mountRoot);
     try {
       await writeFile(bridgePath, buildSftpBridgeScript(hops), { mode: 0o700 });
       await writeFile(probePath, "", { mode: 0o600 });

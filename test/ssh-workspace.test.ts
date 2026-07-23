@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { SshOpenEvent } from "../extensions/termia/protocol.ts";
 import {
   buildRemoteExecCommand,
   buildSftpBridgeScript,
+  prepareWorkspaceMountPath,
   SshChain,
   workspaceMountName,
   workspaceMountPath,
@@ -120,6 +124,18 @@ test("names mount directories by hop depth and leaf identity", () => {
 
 test("mounts the remote root directly at the named workspace directory", () => {
   assert.equal(workspaceMountPath(hops), "/tmp/termia-ssh/2-bob@10.0.0.20-p2222");
+});
+
+test("replaces a stale stable workspace directory", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "termia-stale-mount-"));
+  const target = join(root, "1-alice@host-a");
+  await mkdir(target);
+  await writeFile(join(target, ".termia-probe-old"), "stale");
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  await prepareWorkspaceMountPath(target);
+
+  assert.deepEqual(await readdir(target), []);
 });
 
 test("quotes untrusted hop metadata exactly once", () => {

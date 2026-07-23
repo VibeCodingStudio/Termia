@@ -162,11 +162,19 @@ async function verifyPersistentShell(shell: string): Promise<void> {
 
     await controller.restoreCwd(cwd);
     assert.equal(controller.cwd, cwd);
+    await waitForShellReady(controller);
 
     const immediateAbort = new AbortController();
     const cancelled = controller.execute("sleep 10", { signal: immediateAbort.signal });
     immediateAbort.abort();
-    assert.notEqual((await cancelled).exitCode, 0);
+    const cancelledExit = await cancelled.then(
+      (record) => record.exitCode,
+      (error: Error) => {
+        assert.match(error.message, /aborted before execution/);
+        return 130;
+      },
+    );
+    assert.notEqual(cancelledExit, 0);
     assert.equal((await controller.execute("true")).exitCode, 0);
     const functionCheck = await controller.execute("type termia");
     assert.match(store.readOutput(functionCheck), /termia is a (?:shell )?function/);

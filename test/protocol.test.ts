@@ -142,6 +142,7 @@ test("parses SSH hop open and close frames", () => {
 test("parses the Agent job lifecycle", () => {
   const parser = new ProtocolParser();
   const input = [
+    frame(`A;R;${b64("shell-a")};7`),
     frame(`A;S;${b64("shell-a")};7;4123;${b64("/srv/app")};${b64("/tmp/termia-agent-shell-a/7/output")}`),
     frame(`A;W;${b64("shell-a")};7`),
     frame(`A;F;${b64("shell-a")};7`),
@@ -150,6 +151,7 @@ test("parses the Agent job lifecycle", () => {
   ].join("");
 
   assert.deepEqual(parser.push(input), [
+    { type: "agentJobTransportReady", shellId: "shell-a", jobId: 7 },
     {
       type: "agentJobStart",
       shellId: "shell-a",

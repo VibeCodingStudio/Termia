@@ -19,6 +19,7 @@ __termia_unb64() {
 }
 
 source "$TERMIA_HOOK_DIR/termia-ssh.sh"
+source "$TERMIA_HOOK_DIR/termia-agent.sh"
 
 __termia_ready() {
   local cwd shell_id

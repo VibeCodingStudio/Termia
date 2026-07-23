@@ -172,7 +172,7 @@ git commit -m "feat: add Agent job protocol"
 **Interfaces:**
 - Consumes: `__termia_b64`, `__termia_unb64`, `TERMIA_SHELL_ID`, and `__termia_guard` from each existing shell hook.
 - Produces shell functions:
-  - `__termia_agent_stream <job-id>`: receive bounded Base64 lines, fork the job, emit `agentJobStart`.
+  - `__termia_agent_stream <job-id>`: emit `agentJobTransportReady`, receive bounded Base64 lines, fork the job, emit `agentJobStart`.
   - `__termia_agent_poll`: emit changed waiting/end states.
   - `__termia_agent_foreground <job-id>`: emit foreground/background events around `fg`.
   - `__termia_agent_background <job-id>`: resume a suspended job with `bg`.
@@ -192,9 +192,10 @@ type ShellHarness = {
   dispose(): void;
 };
 
-function launchAgentJob(pty: IPty, jobId: number, command: string): void {
+async function launchAgentJob(pty: IPty, jobId: number, command: string): Promise<void> {
   const encoded = Buffer.from(command).toString("base64");
   pty.write(`__termia_agent_stream ${jobId}\r`);
+  await waitFor("agentJobTransportReady", jobId);
   for (let offset = 0; offset < encoded.length; offset += 256) {
     pty.write(`${encoded.slice(offset, offset + 256)}\r`);
   }
@@ -575,11 +576,12 @@ private activeAgentForeground: AgentExecution | undefined;
 private agentScreenWrite: ((data: string) => void) | undefined;
 ```
 
-`executeAgent()` must validate command/NUL/workspace like `execute()`, reserve an id immediately, register abort before queuing launch, and queue this exact bounded transport when the parent shell is ready:
+`executeAgent()` must validate command/NUL/workspace like `execute()`, reserve an id immediately, register abort before queuing launch, and start this bounded transport when the parent shell is ready:
 
 ```ts
 const encoded = Buffer.from(command, "utf8").toString("base64");
 this.pty?.write(`__termia_agent_stream ${execution.id}\r`);
+// Send the bounded payload only after agentJobTransportReady.
 for (let offset = 0; offset < encoded.length; offset += EXPLICIT_EXEC_CHUNK_SIZE) {
   this.pty?.write(`${encoded.slice(offset, offset + EXPLICIT_EXEC_CHUNK_SIZE)}\r`);
 }
@@ -590,8 +592,9 @@ One ready event dequeues one hidden control action. While any Agent execution ex
 
 - [ ] **Step 5: Route protocol events and transcript bytes without touching history**
 
-Handle all five Agent events before the manual command cases:
+Handle all six Agent events before the manual command cases:
 
+- Transport ready: send the queued Base64 payload and terminator.
 - Start: verify shell id/job id, store pgid/transcript, map an SSH remote absolute transcript through `projectWorkspacePath(this.workspace, path)`, and start a 50ms offset-based file pump.
 - Waiting: set `status = "waiting"` and schedule the interaction loop added in Task 4.
 - Foreground/background: set/clear `activeAgentForeground` and settle the raw attachment promise.

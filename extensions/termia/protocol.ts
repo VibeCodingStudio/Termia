@@ -41,6 +41,11 @@ export type SshOpenEvent = {
   cwd: string;
 };
 export type SshCloseEvent = { type: "sshClose"; shellId: string };
+export type AgentJobTransportReadyEvent = {
+  type: "agentJobTransportReady";
+  shellId: string;
+  jobId: number;
+};
 export type AgentJobStartEvent = {
   type: "agentJobStart";
   shellId: string;
@@ -80,6 +85,7 @@ export type ProtocolToken =
   | QuickAskEvent
   | SshOpenEvent
   | SshCloseEvent
+  | AgentJobTransportReadyEvent
   | AgentJobStartEvent
   | AgentJobWaitingEvent
   | AgentJobForegroundEvent
@@ -249,6 +255,7 @@ function parsePayload(payload: string): Exclude<ProtocolToken, OutputToken> | un
       };
     }
     if (fields.length === 4) {
+      if (action === "R") return { type: "agentJobTransportReady", shellId, jobId };
       if (action === "W") return { type: "agentJobWaiting", shellId, jobId };
       if (action === "F") return { type: "agentJobForeground", shellId, jobId };
       if (action === "B") return { type: "agentJobBackground", shellId, jobId };

@@ -37,7 +37,7 @@ Add one shared, POSIX-style `termia-agent.sh` helper sourced by the Bash, Zsh, a
 
 The fork occurs before `eval`, so the command receives the real in-memory shell snapshot rather than a reconstructed environment. The parent immediately returns to its prompt and can launch the next Agent job.
 
-Each job receives a private directory under `/tmp/termia-agent-<shell-id>/<job-id>` containing its pid, shell job number, transcript, final cwd, and final status. Directories use mode `0700`; files use the shell's `077` umask and are deleted after the tool result is delivered.
+Each job receives a private directory under `/tmp/termia-agent-<shell-id>/<job-id>` containing its pid, shell job number, transcript, final cwd, and final status. The helper creates the root with a temporary `077` umask, restores the user's umask before forking, and deletes the files after the tool result is delivered. A transport-ready frame prevents the interactive shell from consuming Base64 payload before the helper starts reading it.
 
 ### Job-control protocol
 

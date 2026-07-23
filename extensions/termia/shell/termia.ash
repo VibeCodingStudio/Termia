@@ -56,7 +56,7 @@ __termia_complete() {
   __termia_command=$(printf '%s' "$__termia_history" \
     | command sed 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*//')
   case "$__termia_command" in
-    ''|__termia_exec\ *|termia|termia\ *|ssh|ssh\ *|*termia.ash*) return ;;
+    ''|__termia_*|termia|termia\ *|ssh|ssh\ *|*termia.ash*) return ;;
   esac
   __termia_shell_id=$(printf '%s' "$TERMIA_SHELL_ID" | __termia_b64)
   __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
@@ -100,6 +100,18 @@ __termia_exec() {
     "$__termia_shell_id" "$__termia_agent_sequence" "$__termia_status" "$__termia_cwd" > /dev/tty
   __termia_guard=0
   return "$__termia_status"
+}
+
+__termia_exec_stream() {
+  local __termia_payload= __termia_chunk
+  while IFS= read -r __termia_chunk; do
+    [ "$__termia_chunk" = . ] && break
+    case "$__termia_chunk" in
+      ''|*[!A-Za-z0-9+/=]*) return 2 ;;
+    esac
+    __termia_payload=$__termia_payload$__termia_chunk
+  done
+  __termia_exec "$__termia_payload"
 }
 
 termia() {

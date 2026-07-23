@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make long BusyBox ash commands timeout correctly and give reconnectable SSH workspaces stable local paths.
+**Goal:** Make long BusyBox ash commands timeout correctly, keep interactive Agent commands safe to attach, and give reconnectable SSH workspaces stable local paths.
 
-**Architecture:** Keep the existing PTY and SSHFS ownership model. Split only explicit-exec input lines, interrupt any written execution on abort, and separate the stable mount root from the random bridge-script root.
+**Architecture:** Keep the existing PTY and SSHFS ownership model. Split only explicit-exec input lines, interrupt any written execution on abort, make terminal attachment single-flight, and separate the stable mount root from the random bridge-script root.
 
 **Tech Stack:** TypeScript, Node.js, node-pty, BusyBox-compatible shell, SSHFS, Node test runner.
 
@@ -40,7 +40,7 @@ Expected: both tests fail against the single-line/gated-abort implementation.
 
 - [ ] **Step 3: Implement the minimum fix**
 
-Emit `__termia_payload=` plus bounded append lines and a final `__termia_exec "$__termia_payload"`. Change the abort condition from “has sequence” to “was written”, and ignore all `__termia_*` ash history entries.
+Enter `__termia_exec_stream`, send bounded Base64 lines plus a terminator, and invoke `__termia_exec` inside the reader. Change the abort condition from “has sequence” to “was written”, and ignore all `__termia_*` ash history entries.
 
 - [ ] **Step 4: Verify GREEN**
 
@@ -48,7 +48,37 @@ Run the focused command from Step 2 and `node --test test/pty-bash.test.ts test/
 
 Expected: all focused PTY tests pass.
 
-### Task 2: Stable SSH workspace path
+### Task 2: Single-flight interactive attachment
+
+**Files:**
+- Modify: `test/terminal.test.ts`
+- Modify: `extensions/termia/terminal.ts`
+
+**Interfaces:**
+- Consumes: `TerminalController.enter(ctx)` and an already-running `TerminalController.execute(...)`.
+- Produces: one active stdin forwarder and one Pi TUI stop/start lifecycle.
+
+- [ ] **Step 1: Write the failing concurrency test**
+
+Start one attachment, attempt a second before detaching, and assert that the second rejects immediately while stdin gains only one listener.
+
+- [ ] **Step 2: Verify RED**
+
+Run: `node --test --test-name-pattern='allows only one terminal attachment' test/terminal.test.ts`
+
+Expected: failure because both current calls install independent stdin/TUI handlers.
+
+- [ ] **Step 3: Implement the minimum fix**
+
+Reserve the attached state before opening `ctx.ui.custom`, reject another `enter()` while reserved, and release the reservation through the existing idempotent `finish`/error paths.
+
+- [ ] **Step 4: Verify interactive input and GREEN**
+
+Run a focused test that starts a shell `read`, attaches once, writes input through stdin, detaches, and confirms both the command and TUI settle exactly once.
+
+Expected: the concurrency regression and interactive-input test pass without duplicate characters or uncaught exceptions.
+
+### Task 3: Stable SSH workspace path
 
 **Files:**
 - Modify: `test/ssh-workspace.test.ts`
@@ -78,7 +108,7 @@ Run: `node --test test/ssh-workspace.test.ts test/ssh-integration.test.ts`.
 
 Expected: stable-path unit tests pass; integration runs when its prerequisites are available.
 
-### Task 3: Release 0.1.1
+### Task 4: Release 0.1.1
 
 **Files:**
 - Modify: `package.json`

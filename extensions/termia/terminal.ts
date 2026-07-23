@@ -40,6 +40,7 @@ type ActiveExecution = {
 };
 
 const SHELL_DIRECTORY = resolve(dirname(fileURLToPath(import.meta.url)), "./shell");
+const EXPLICIT_EXEC_CHUNK_SIZE = 256;
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
@@ -192,7 +193,7 @@ export class TerminalController {
             return;
           }
           execution.aborting = true;
-          if (execution.sequence !== undefined) this.pty?.write("\u0003");
+          if (execution.written) this.pty?.write("\u0003");
         }
       };
       const execution: ActiveExecution = {
@@ -262,6 +263,8 @@ export class TerminalController {
       this.resumeUi();
       throw new Error("Termia terminal mode requires a TTY");
     }
+    if (this.attached) throw new Error("Termia terminal is already attached");
+    this.attached = true;
 
     try {
       return await ctx.ui.custom<TerminalAttachExit>((tui, _theme, _keys, done) => {
@@ -318,7 +321,6 @@ export class TerminalController {
           process.stdin.on("data", onInput);
           process.stdin.resume();
           process.on("SIGWINCH", onResize);
-          this.attached = true;
           this.detach = finish;
           onResize();
           if (options.refresh !== false) this.pty?.write("\u000c");
@@ -330,6 +332,7 @@ export class TerminalController {
         return { render: () => [], invalidate: () => {}, dispose: finish };
       });
     } catch (error) {
+      this.attached = false;
       this.resumeUi();
       throw error;
     }
@@ -536,7 +539,12 @@ export class TerminalController {
     if (this.activeQuickAsk === undefined) {
       if (this.explicitExecutionShells.has(this.activeShellId)) {
         const encoded = Buffer.from(command, "utf8").toString("base64");
-        this.pty?.write(`__termia_exec ${shellQuote(encoded)}\r`);
+        this.pty?.write("__termia_exec_stream\r");
+        for (let offset = 0; offset < encoded.length; offset += EXPLICIT_EXEC_CHUNK_SIZE) {
+          const chunk = encoded.slice(offset, offset + EXPLICIT_EXEC_CHUNK_SIZE);
+          this.pty?.write(`${chunk}\r`);
+        }
+        this.pty?.write(".\r");
       } else {
         this.pty?.write(`eval -- ${shellQuote(command)}\r`);
       }

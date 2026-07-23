@@ -100,7 +100,7 @@ test("names mount directories by hop depth and leaf identity", () => {
 });
 
 test("mounts the remote root directly at the named workspace directory", () => {
-  assert.equal(workspaceMountPath("/tmp/termia-ssh", hops), "/tmp/termia-ssh/2-bob@10.0.0.20-p2222");
+  assert.equal(workspaceMountPath(hops), "/tmp/termia-ssh/2-bob@10.0.0.20-p2222");
 });
 
 test("quotes untrusted hop metadata exactly once", () => {

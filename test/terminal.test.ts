@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { IPty } from "node-pty";
 import { HistoryStore, type CommandRecord } from "../extensions/termia/history.ts";
 import type { SshOpenEvent } from "../extensions/termia/protocol.ts";
 import type { MountOperations } from "../extensions/termia/ssh-workspace.ts";
@@ -36,10 +37,88 @@ function waitForCommand(controller: TerminalController, expected: string): Promi
   });
 }
 
+async function waitForShellReady(controller: TerminalController): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (Reflect.get(controller, "shellReady") === true) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for the Termia shell prompt");
+}
+
+function installFakePty(controller: TerminalController, explicit = false): string[] {
+  const writes: string[] = [];
+  const child = {
+    write: (data: string) => writes.push(data),
+    resize: () => {},
+    kill: () => {},
+    onData: () => ({ dispose: () => {} }),
+    onExit: () => ({ dispose: () => {} }),
+  } as unknown as IPty;
+  const internals = controller as unknown as {
+    pty: IPty;
+    shellReady: boolean;
+    explicitExecutionShells: Set<string>;
+  };
+  internals.pty = child;
+  internals.shellReady = true;
+  if (explicit) internals.explicitExecutionShells.add("local");
+  return writes;
+}
+
 test("detects only the Termia PTY marker", () => {
   assert.equal(isTermiaPty("1"), true);
   assert.equal(isTermiaPty("0"), false);
   assert.equal(isTermiaPty(undefined), false);
+});
+
+test("chunks long explicit execution input below the ash line limit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-chunks-"));
+  const store = new HistoryStore(join(root, "state"));
+  const controller = new TerminalController(store);
+  const writes = installFakePty(controller, true);
+  const command = `printf '%s' '${"x".repeat(600)}'`;
+  const pending = controller.execute(command, { isolated: true });
+  const settled = pending.catch(() => undefined);
+
+  try {
+    assert.ok(writes.length > 2);
+    assert.ok(writes.every((line) => line.length <= 300));
+    assert.equal(writes[0], "__termia_exec_stream\r");
+    assert.equal(writes.at(-1), ".\r");
+    const encoded = writes.slice(1, -1).map((line) => {
+      const match = /^([A-Za-z0-9+/=]+)\r$/.exec(line);
+      assert.ok(match);
+      return match[1];
+    }).join("");
+    assert.equal(Buffer.from(encoded, "base64").toString("utf8"), `(${command})`);
+  } finally {
+    controller.dispose();
+    await settled;
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("interrupts written commands before the shell start marker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-prestart-"));
+  const store = new HistoryStore(join(root, "state"));
+  const controller = new TerminalController(store);
+  const writes = installFakePty(controller);
+  const abort = new AbortController();
+  const pending = controller.execute("true", { signal: abort.signal });
+  const settled = pending.catch(() => undefined);
+
+  try {
+    assert.equal(writes.length, 1);
+    abort.abort();
+    assert.equal(writes.at(-1), "\u0003");
+  } finally {
+    controller.dispose();
+    await settled;
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 async function verifyPersistentShell(shell: string): Promise<void> {
@@ -299,6 +378,16 @@ test("runs Agent commands and quick asks in BusyBox ash", { skip: ash === undefi
     assert.equal(controller.cwd, target);
     assert.match(store.readOutput(command), /busybox:kept:.*\/target/);
 
+    const longValue = "x".repeat(600);
+    const longCommand = await controller.execute(`printf '%s\\n' '${longValue}'`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    assert.match(store.readOutput(longCommand), new RegExp(longValue));
+    assert.equal(
+      store.listCompletedCommands(20).some((record) => record.command.startsWith("__termia_")),
+      false,
+    );
+
     const abort = new AbortController();
     const interrupted = controller.execute("sleep 10", { signal: abort.signal });
     setTimeout(() => abort.abort(), 100);
@@ -310,6 +399,7 @@ test("runs Agent commands and quick asks in BusyBox ash", { skip: ash === undefi
     const completed = await manualRecord;
     assert.equal(completed.exitCode, 0);
     assert.equal(store.readOutput(completed), "busybox-manual\r\n");
+    await waitForShellReady(controller);
 
     const failedRecord = waitForCommand(controller, "false");
     controller.write("false\r");
@@ -406,6 +496,83 @@ test("ignores Ctrl+] while a quick ask is running", async (t) => {
 
   controller.dispose();
   assert.equal((await attachment).type, "detach");
+});
+
+test("allows only one terminal attachment", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-attach-"));
+  const store = new HistoryStore(join(root, "state"));
+  const controller = new TerminalController(store);
+  const writes = installFakePty(controller);
+  const stdinDescriptors = {
+    isTTY: Object.getOwnPropertyDescriptor(process.stdin, "isTTY"),
+    isRaw: Object.getOwnPropertyDescriptor(process.stdin, "isRaw"),
+    setRawMode: Object.getOwnPropertyDescriptor(process.stdin, "setRawMode"),
+  };
+  const stdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const restore = (target: object, key: string, descriptor: PropertyDescriptor | undefined) => {
+    if (descriptor === undefined) Reflect.deleteProperty(target, key);
+    else Object.defineProperty(target, key, descriptor);
+  };
+  Object.defineProperties(process.stdin, {
+    isTTY: { configurable: true, value: true },
+    isRaw: { configurable: true, writable: true, value: false },
+    setRawMode: {
+      configurable: true,
+      value: (raw: boolean) => Reflect.set(process.stdin, "isRaw", raw),
+    },
+  });
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+  t.after(() => {
+    controller.dispose();
+    process.stdin.pause();
+    store.close();
+    restore(process.stdin, "isTTY", stdinDescriptors.isTTY);
+    restore(process.stdin, "isRaw", stdinDescriptors.isRaw);
+    restore(process.stdin, "setRawMode", stdinDescriptors.setRawMode);
+    restore(process.stdout, "isTTY", stdoutIsTTY);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  let starts = 0;
+  let stops = 0;
+  const tui = {
+    start: () => starts += 1,
+    stop: () => stops += 1,
+    requestRender: () => {},
+  };
+  const ctx = {
+    ui: {
+      custom: (factory: (...args: unknown[]) => unknown) => new Promise((resolve) => {
+        factory(tui, undefined, undefined, resolve);
+      }),
+    },
+  } as unknown as Parameters<TerminalController["enter"]>[0];
+  const baselineListeners = process.stdin.listenerCount("data");
+  const first = controller.enter(ctx, { refresh: false });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const second = controller.enter(ctx, { refresh: false });
+
+  try {
+    const outcome = await Promise.race([
+      second.then(
+        () => "resolved",
+        (error: unknown) => `rejected:${String(error)}`,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 50)),
+    ]);
+    assert.equal(outcome, "rejected:Error: Termia terminal is already attached");
+    assert.equal(process.stdin.listenerCount("data"), baselineListeners + 1);
+    assert.equal(stops, 1);
+    const beforeInput = writes.length;
+    process.stdin.emit("data", Buffer.from("password\r"));
+    assert.equal(writes.length, beforeInput + 1);
+    assert.equal(Buffer.from(writes.at(-1)!).toString(), "password\r");
+  } finally {
+    process.stdin.emit("data", Buffer.from([0x1d]));
+    await Promise.allSettled([first, second]);
+  }
+  assert.equal(process.stdin.listenerCount("data"), baselineListeners);
+  assert.equal(starts, 1);
 });
 
 class TerminalMounts implements MountOperations {

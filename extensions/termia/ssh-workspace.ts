@@ -21,6 +21,7 @@ import {
 
 const MOUNT_TIMEOUT_MS = 10_000;
 const STOP_TIMEOUT_MS = 3_000;
+const WORKSPACE_ROOT = join(tmpdir(), "termia-ssh");
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -68,8 +69,8 @@ export function workspaceMountName(hops: readonly SshHop[]): string {
   return `${hops.length}-${identity}`;
 }
 
-export function workspaceMountPath(runtimeRoot: string, hops: readonly SshHop[]): string {
-  return join(runtimeRoot, workspaceMountName(hops));
+export function workspaceMountPath(hops: readonly SshHop[]): string {
+  return join(WORKSPACE_ROOT, workspaceMountName(hops));
 }
 
 function buildControlExitCommand(hops: readonly SshHop[]): string {
@@ -143,13 +144,27 @@ export class WorkspaceMount implements MountOperations {
     if (this.mounts.has(leaf.shellId)) throw new Error(`SSH shell is already mounted: ${leaf.shellId}`);
 
     const runtimeRoot = await this.ensureRuntimeRoot();
-    const mountRoot = workspaceMountPath(runtimeRoot, hops);
+    const mountRoot = workspaceMountPath(hops);
     const directory = mountRoot;
-    const bridgePath = `${mountRoot}.bridge`;
+    const bridgePath = join(runtimeRoot, `${workspaceMountName(hops)}.bridge`);
     const probePath = join(mountRoot, `.termia-probe-${leaf.shellId}`);
-    await mkdir(mountRoot, { recursive: true, mode: 0o700 });
-    await writeFile(bridgePath, buildSftpBridgeScript(hops), { mode: 0o700 });
-    await writeFile(probePath, "", { mode: 0o600 });
+    await mkdir(WORKSPACE_ROOT, { recursive: true, mode: 0o700 });
+    try {
+      await mkdir(mountRoot, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`Termia SSH workspace is already in use: ${mountRoot}`, { cause: error });
+      }
+      throw error;
+    }
+    try {
+      await writeFile(bridgePath, buildSftpBridgeScript(hops), { mode: 0o700 });
+      await writeFile(probePath, "", { mode: 0o600 });
+    } catch (error) {
+      await rm(mountRoot, { recursive: true, force: true });
+      await rm(bridgePath, { force: true });
+      throw error;
+    }
 
     const child = spawn("sshfs", [
       "termia:/",

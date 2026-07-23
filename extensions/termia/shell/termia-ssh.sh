@@ -147,7 +147,7 @@ ssh() {
     return $?
   }
 
-  command tar -C "$TERMIA_HOOK_DIR" -cf - termia.ash termia.bash termia.zsh termia-ssh.sh \
+  command tar -C "$TERMIA_HOOK_DIR" -cf - termia.ash termia.bash termia.zsh termia-ssh.sh termia-agent.sh \
     | command ssh -S "$control_path" "$@" \
       "umask 077; tar -C $(__termia_shell_quote "$remote_dir") -xf -" || {
         __termia_ssh_unmanaged_master "$control_path" "$destination" "$remote_dir" "$@"

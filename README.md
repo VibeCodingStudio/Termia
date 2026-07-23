@@ -32,12 +32,12 @@ pi install ./
 
 ## Quick start
 
-Start `pi` in a persisted session and run `/termia`. Press `Ctrl+]` to switch
-between Pi and the persistent terminal.
+Start `pi` in a persisted session and run `/termia`. While the Agent is idle,
+press `Ctrl+]` to switch between Pi and the persistent terminal.
 
 ```text
 /termia           enable or disable Termia for this Pi process
-Ctrl+]            switch between Agent and the persistent shell
+Ctrl+]            switch between Agent and the persistent shell while the Agent is idle
 !command          run in the persistent shell and include the result in Agent context
 !!command         run in the persistent shell without adding the result to Agent context
 /termia-history   open recorded command history
@@ -49,7 +49,8 @@ empty session under Termia-managed storage. Native `/new`, `/resume`, and
 mode and returns to the exact session that was active before enabling it.
 Termia mode is never persisted and starts disabled in every new Pi process.
 On first entry, Pi shows a reminder that `Ctrl+]` switches between Agent and
-the persistent shell. Any unfinished Agent prompt is preserved across the switch.
+the persistent shell while the Agent is idle. Any unfinished Agent prompt is
+preserved across the switch.
 
 Enabling Termia also activates fixed operational guidance for evidence-first
 troubleshooting, local and SSH workspace boundaries, nested SSH identity, and
@@ -90,25 +91,39 @@ message through the active Pi session, so that exchange and the outer
 conversation's AGENTS.md/CLAUDE.md context remain active. If the shell cwd
 changed, attached mode moves Pi to that cwd before sending the message.
 
-While either kind of quick ask is active, Pi's `bash` tool executes in the same
-persistent Termia PTY as manual commands, `!`, and `!!`. Agent commands therefore
-share the shell's current directory, exported variables, aliases, and functions.
-While Termia mode is enabled, ordinary Pi `bash` runs in an isolated child shell
-inside the same PTY. Its command and output enter Termia history, while cwd and
-environment changes remain local to that one tool call. When the mode is
-disabled, the same Pi-generated tool definition delegates to Pi's local bash
-backend and does not create Termia history.
+While either kind of quick ask is active, Pi's `bash` tool keeps its existing
+synchronous path in the persistent Termia PTY, alongside manual commands, `!`,
+and `!!`. It therefore shares the shell's live cwd, variables, aliases, and
+functions and remains part of that quick ask's Termia history.
+
+While Termia mode is enabled, ordinary Pi `bash` instead forks an isolated
+background subshell from the exact current Termia shell. It inherits the cwd,
+exported and unexported variables, functions, aliases, shell options, and active
+virtual environment at launch. Its assignments, option changes, and `cd` do not
+change the parent shell. Multiple non-interactive Agent commands can run
+concurrently, and their commands, helper traffic, prompts, and output are not
+written to Termia history. When the mode is disabled, the same Pi-generated tool
+definition delegates to Pi's local bash backend.
 Termia delegates the tool schema, output truncation, and Agent loop to Pi and
 only supplies the PTY execution operation.
+
+If an ordinary Agent `bash` command waits for terminal input, Termia opens an
+input view automatically. Terminal echo controls whether input is visible, so
+password prompts mask naturally while confirmations and other input remain
+visible. If several commands are waiting, choose one with Up/Down and Enter.
+Repeated prompts stay in the selected view; press `Ctrl+G` to return to the job
+menu. `Ctrl+]` is unavailable while the Agent is running. Use the main `/termia`
+terminal for full-screen interactive programs.
 
 Quick asks use Pi's native print behavior: Termia stays silent while Pi thinks
 and runs tools, then prints only the final answer or final error. Detached mode
 delegates final rendering to Pi's public `runPrintMode`; `--attach` prints the
 settled answer from the active Pi conversation.
 
-Agent `bash` output is still streamed to Pi and stored under its stable Termia
-history index, but it is not echoed into the terminal during a quick ask.
-Normal interactive shell output remains unchanged.
+Agent `bash` output is still streamed to Pi. Quick-ask Bash keeps its stable
+Termia history index but is not echoed into the terminal; ordinary Agent Bash
+stays completely outside Termia history. Normal interactive shell output
+remains unchanged.
 
 `h~N`, `-n N`, and `--last N` include metadata for the last N completed Termia
 commands; `--all` includes up to 1,000. Here `-n` means history count, not Pi's
@@ -120,8 +135,7 @@ print mode without persistence. Pi session-selection/lifecycle options,
 `--api-key`, `--name`, and `@file` are rejected.
 
 During a quick ask, `Ctrl+C` aborts it and returns status 130 to the shell.
-`Ctrl+]` aborts it and detaches back to Pi; the shell remains reusable on the
-next `/termia`.
+`Ctrl+]` is ignored until the quick ask finishes, leaving the shell reusable.
 
 In `/termia-history`, use Up/Down to move, Space to select multiple commands,
 Pi's configured tool-output expansion key (`Ctrl+O` by default) to preview the
@@ -151,14 +165,14 @@ identity flags, and other SSH forms keep native SSH behavior. Managed hops can
 nest (`local -> A -> B -> C`): every new SSH process and credential lookup runs
 on its immediate parent host, so B and C keys do not need to exist locally.
 
-Pressing `Ctrl+]` returns to Pi without closing the SSH processes. Pi keeps a
+While the Agent is idle, pressing `Ctrl+]` returns to Pi without closing the SSH processes. Pi keeps a
 physical SSHFS mount for its built-in read/edit/write/grep/find/ls tools,
-`@file`, project resources, and Agent bash, while the prompt and status expose
-only the logical URI such as `ssh://user@host/srv/app`. Absolute file paths map
-to the remote root; relative paths use the remote cwd. Use an absolute path
-instead of `~` in file tools. Agent bash continues through the same remote PTY,
-and its commands remain selectable in `/termia-history` under non-selectable
-workspace separators.
+`@file`, project resources, and Agent bash transcripts, while the prompt and
+status expose only the logical URI such as `ssh://user@host/srv/app`. Absolute
+file paths map to the remote root; relative paths use the remote cwd. Use an absolute path
+instead of `~` in file tools. Agent bash is forked by that same remote shell and
+remains outside `/termia-history`; manual commands, `!`, and `!!` retain their
+SSH workspace provenance.
 
 The local machine needs `sshfs` and `fusermount3` (macOS uses `umount`). If
 SFTP is unavailable, the interactive SSH shell still works but Termia refuses
@@ -198,7 +212,7 @@ or migrated.
 - bash, zsh, BusyBox ash, and BusyBox sh interactive shells
 - Pi TUI mode with a persisted session
 - bounded bang results in the Pi session; full raw output remains available through `/termia-history`
-- with Termia mode enabled, Agent `bash` uses the persistent PTY directly during `termia ...` and `termia --attach`; ordinary Pi bash uses an isolated child shell in that PTY and is recorded in Termia history
+- with Termia mode enabled, Agent `bash` uses the persistent PTY directly during `termia ...` and `termia --attach`; ordinary Pi bash uses concurrent isolated child jobs and stays outside Termia history
 
 ## Uninstall
 

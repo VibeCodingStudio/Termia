@@ -674,6 +674,7 @@ export default function termia(pi: ExtensionAPI): void {
       (draft) => {
         state.editorDraft = draft;
       },
+      () => ctx.isIdle(),
     );
     restoreEditorDraft(ctx, state);
     if (!state.enabled) {

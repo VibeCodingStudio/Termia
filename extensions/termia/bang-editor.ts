@@ -136,6 +136,7 @@ function restoreBangSubmission(text: string): string | undefined {
 export class BangEditor implements EditorComponent {
   readonly #base: EditorComponent;
   readonly #enabled: () => boolean;
+  readonly #idle: () => boolean;
   readonly #onTerminalShortcut: (draft: string) => void;
   #onSubmit: (text: string) => void = () => {};
   #onChange: (text: string) => void = () => {};
@@ -144,9 +145,11 @@ export class BangEditor implements EditorComponent {
     base: EditorComponent,
     enabled: () => boolean,
     onTerminalShortcut: (draft: string) => void = () => {},
+    idle: () => boolean = () => true,
   ) {
     this.#base = base;
     this.#enabled = enabled;
+    this.#idle = idle;
     this.#onTerminalShortcut = onTerminalShortcut;
   }
 
@@ -233,6 +236,7 @@ export class BangEditor implements EditorComponent {
 
   handleInput(data: string): void {
     if (this.#enabled() && matchesKey(data, "ctrl+]")) {
+      if (!this.#idle()) return;
       this.#onTerminalShortcut(this.#base.getText());
       this.#onSubmit(`/termia ${TERMINAL_INVOCATION}`);
       return;
@@ -278,6 +282,7 @@ export function createBangEditorFactory(
   previous: EditorFactory | undefined,
   enabled: () => boolean,
   onTerminalShortcut: (draft: string) => void = () => {},
+  idle: () => boolean = () => true,
 ): EditorFactory {
   return (tui, theme, keybindings) =>
     new BangEditor(
@@ -286,6 +291,7 @@ export function createBangEditorFactory(
         : previous(tui, theme, keybindings),
       enabled,
       onTerminalShortcut,
+      idle,
     );
 }
 
@@ -294,10 +300,11 @@ export function installBangEditor(
   installed: EditorFactory | undefined,
   enabled: () => boolean,
   onTerminalShortcut: (draft: string) => void = () => {},
+  idle: () => boolean = () => true,
 ): EditorFactory {
   const current = ui.getEditorComponent();
   if (installed !== undefined && current === installed) return installed;
-  const factory = createBangEditorFactory(current, enabled, onTerminalShortcut);
+  const factory = createBangEditorFactory(current, enabled, onTerminalShortcut, idle);
   ui.setEditorComponent(factory);
   return factory;
 }

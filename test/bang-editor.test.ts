@@ -138,6 +138,32 @@ test("uses Ctrl+] to enter the PTY only in Termia mode and preserves the draft",
   assert.deepEqual(base.history, []);
 });
 
+test("consumes busy Ctrl+] without replaying it after the Agent becomes idle", () => {
+  const base = new FakeEditor();
+  let idle = false;
+  const drafts: string[] = [];
+  const submitted: string[] = [];
+  const editor = new BangEditor(
+    base,
+    () => true,
+    (draft) => drafts.push(draft),
+    () => idle,
+  );
+  editor.onSubmit = (text) => submitted.push(text);
+  editor.setText("keep this draft");
+
+  editor.handleInput("\x1d");
+  idle = true;
+
+  assert.deepEqual(base.inputs, []);
+  assert.deepEqual(drafts, []);
+  assert.deepEqual(submitted, []);
+
+  editor.handleInput("\x1d");
+  assert.deepEqual(drafts, ["keep this draft"]);
+  assert.deepEqual(submitted, ["/termia __terminal"]);
+});
+
 test("exposes Pi app handlers from the wrapped editor", () => {
   const base = new FakeEditor();
   const editor = new BangEditor(base, () => true);

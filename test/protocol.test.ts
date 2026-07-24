@@ -14,7 +14,7 @@ test("parses output and a command start in order", () => {
   ]);
 });
 
-test("keeps removed quick-ask frames as terminal output", () => {
+test("keeps removed Q frames as terminal output", () => {
   const parser = new ProtocolParser();
   const value = frame(`Q;${b64("local")};${b64("/tmp")};1;${b64("why\u0000")}`);
   assert.deepEqual(parser.push(value), [{ type: "output", data: value }]);

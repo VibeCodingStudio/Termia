@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import type { SshOpenEvent } from "./protocol.ts";
 import {
   fileWorkspace,
@@ -45,7 +45,7 @@ function quote(value: string): string {
 }
 
 function wrapRemote(parent: SshHop, command: string): string {
-  return `ssh -S ${quote(parent.controlPath)} ${quote(parent.destination)} ${quote(`exec ${command}`)}`;
+  return `ssh -T -S ${quote(parent.controlPath)} ${quote(parent.destination)} ${quote(`exec ${command}`)}`;
 }
 
 export function buildRemoteExecCommand(hops: readonly SshHop[], remoteCommand: string): string {
@@ -53,13 +53,32 @@ export function buildRemoteExecCommand(hops: readonly SshHop[], remoteCommand: s
   if (leaf === undefined) throw new Error("Cannot execute without an SSH hop");
   validateField("remote command", remoteCommand);
   for (const hop of hops) validateHop(hop);
-  let command = `ssh -S ${quote(leaf.controlPath)} ${quote(leaf.destination)} ${quote(`exec ${remoteCommand}`)}`;
+  let command = `ssh -T -S ${quote(leaf.controlPath)} ${quote(leaf.destination)} ${quote(remoteCommand)}`;
   for (let index = hops.length - 2; index >= 0; index -= 1) {
     const parent = hops[index];
     if (parent === undefined) throw new Error("Invalid SSH hop chain");
     command = wrapRemote(parent, command);
   }
   return command;
+}
+
+export function buildRemoteBashCommand(
+  hops: readonly SshHop[],
+  cwd: string,
+  command: string,
+): string {
+  validateField("cwd", cwd);
+  if (!posix.isAbsolute(cwd)) throw new Error("SSH cwd must be absolute");
+  if (command.includes("\0")) throw new Error("SSH command cannot contain NUL bytes");
+  const payload = Buffer.from(command).toString("base64");
+  const decode = "if command -v base64 >/dev/null 2>&1; then if base64 -d </dev/null >/dev/null 2>&1; then base64 -d; elif base64 --decode </dev/null >/dev/null 2>&1; then base64 --decode; else base64 -D; fi; else ucode -e 'let fs = require(\"fs\"); print(b64dec(fs.readfile(\"/dev/stdin\")))'; fi";
+  const remoteCommand = [
+    `cd -- ${quote(cwd)} || exit`,
+    `__termia_command=$(printf '%s' ${quote(payload)} | { ${decode}; }) || exit`,
+    `[ -z "\${SHELL-}" ] || [ ! -x "$SHELL" ] || exec "$SHELL" -c "$__termia_command"`,
+    `exec /bin/sh -c "$__termia_command"`,
+  ].join("; ");
+  return buildRemoteExecCommand(hops, remoteCommand);
 }
 
 export function buildSftpBridgeScript(hops: readonly SshHop[]): string {
@@ -423,25 +442,6 @@ export class SshChain {
       workspaceUri: workspaceUri(target),
       hopChain: states.map((state) => state.hop.destination),
     };
-  }
-
-  async signalProcessGroup(
-    shellId: string,
-    processGroupId: number,
-    signal: "INT" | "KILL",
-  ): Promise<void> {
-    if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) {
-      throw new Error("Invalid Agent process group");
-    }
-    if (signal !== "INT" && signal !== "KILL") throw new Error("Invalid Agent signal");
-    const index = this.hops.findIndex((state) => state.hop.shellId === shellId);
-    if (index < 0) throw new Error(`Unknown SSH shell: ${shellId}`);
-    const hops = this.hops.slice(0, index + 1).map((state) => state.hop);
-    await runFile(
-      "/bin/sh",
-      ["-c", buildRemoteExecCommand(hops, `kill -${signal} -${processGroupId}`)],
-      STOP_TIMEOUT_MS,
-    );
   }
 
   isHealthy(binding: WorkspaceBinding): boolean {

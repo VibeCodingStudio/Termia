@@ -3,13 +3,17 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
+import {
+  createLocalBashOperations,
+  type BashOperations,
+} from "@earendil-works/pi-coding-agent";
 import { HistoryStore } from "../extensions/termia/history.ts";
 import {
   createModeBashOperations,
   createPtyBashOperations,
 } from "../extensions/termia/pty-bash.ts";
 import { TerminalController } from "../extensions/termia/terminal.ts";
+import { sshWorkspace, type SshHop } from "../extensions/termia/workspace.ts";
 
 test("adapts Pi bash operations to the persistent Termia shell", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "termia-pty-bash-"));
@@ -54,11 +58,10 @@ test("adapts Pi bash operations to the persistent Termia shell", async (t) => {
   );
 });
 
-test("isolates ordinary Pi bash without Termia history", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "termia-ordinary-bash-"));
+test("uses Pi detached Bash with ignored stdin while Termia is enabled locally", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-mode-bash-"));
   const cwd = join(root, "cwd");
-  const target = join(cwd, "target");
-  mkdirSync(target, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
   const history = new HistoryStore(join(root, "state"));
   const terminal = new TerminalController(history);
   t.after(() => {
@@ -66,118 +69,65 @@ test("isolates ordinary Pi bash without Termia history", async (t) => {
     history.close();
     rmSync(root, { recursive: true, force: true });
   });
-
-  terminal.start(cwd);
-  await terminal.execute([
-    "TERMIA_ORDINARY_VALUE=parent",
-    "termia_ordinary_function() { printf 'function:%s\\n' \"$TERMIA_ORDINARY_VALUE\"; }",
-    "alias termia_ordinary_alias='printf \"alias:parent\\n\"'",
-    "set -f",
-  ].join("; "));
   const operations = createModeBashOperations(
     () => true,
     createLocalBashOperations(),
     terminal,
   );
-  const before = history.listCompletedCommands(100).length;
-  const firstCommand = [
-    "printf 'first:%s:%s:%s\\n' \"$TERMIA_ORDINARY_VALUE\" \"$PWD\" \"$-\"",
-    "termia_ordinary_function",
-    "eval termia_ordinary_alias",
-    "TERMIA_ORDINARY_VALUE=child",
-    "termia_ordinary_function() { printf child-function; }",
-    "alias termia_ordinary_alias='printf child-alias'",
-    "set +f",
-    `cd ${target}`,
-  ].join("; ");
-  const secondCommand = `printf 'second:%s:%s:%s\\n' "$TERMIA_ORDINARY_VALUE" "$PWD" "$-"; termia_ordinary_function; eval termia_ordinary_alias`;
-  const firstOutput: Buffer[] = [];
-  const firstResult = await operations.exec(firstCommand, cwd, {
-    onData: (data) => firstOutput.push(data),
-  });
   const output: Buffer[] = [];
-  const secondResult = await operations.exec(secondCommand, cwd, {
-    onData: (data) => output.push(data),
-  });
 
-  assert.equal(firstResult.exitCode, 0);
-  assert.equal(secondResult.exitCode, 0);
-  assert.match(Buffer.concat(firstOutput).toString(), new RegExp(`first:parent:${cwd}:.*f`));
-  assert.match(Buffer.concat(firstOutput).toString(), /function:parent/);
-  assert.match(Buffer.concat(firstOutput).toString(), /alias:parent/);
-  assert.match(Buffer.concat(output).toString(), new RegExp(`second:parent:${cwd}:.*f`));
-  assert.match(Buffer.concat(output).toString(), /function:parent/);
-  assert.match(Buffer.concat(output).toString(), /alias:parent/);
-  assert.equal(terminal.cwd, cwd);
-  assert.equal(history.listCompletedCommands(100).length, before);
-
-  const manual = await terminal.execute("printf manual-only");
-  assert.equal(history.listCompletedCommands(100).length, before + 1);
-  assert.match(history.readOutput(manual), /manual-only/);
-  assert.doesNotMatch(history.readOutput(manual), /first:|second:|function:parent|alias:parent/);
-});
-
-test("uses Pi local bash while disabled and isolated Termia PTY commands while enabled", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "termia-mode-bash-"));
-  const cwd = join(root, "cwd");
-  const target = join(cwd, "target");
-  mkdirSync(target, { recursive: true });
-  const history = new HistoryStore(join(root, "state"));
-  const terminal = new TerminalController(history);
-  t.after(() => {
-    terminal.dispose();
-    history.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  let enabled = false;
-  const operations = createModeBashOperations(
-    () => enabled,
-    createLocalBashOperations(),
-    terminal,
+  const local = await operations.exec(
+    "if [ -t 0 ]; then echo tty; else echo no-tty; fi; if (exec 3</dev/tty) 2>/dev/null; then echo controlling-tty; else echo no-controlling-tty; fi; IFS= read -r value || echo eof",
+    cwd,
+    {
+      onData: (data) => output.push(data),
+    },
   );
-  const output: Buffer[] = [];
-
-  const local = await operations.exec("printf local", cwd, {
-    onData: (data) => output.push(data),
-  });
 
   assert.equal(local.exitCode, 0);
-  assert.equal(Buffer.concat(output).toString(), "local");
+  assert.equal(Buffer.concat(output).toString(), "no-tty\nno-controlling-tty\neof\n");
   assert.equal(terminal.running, false);
   assert.deepEqual(history.listCompletedCommands(10), []);
+});
 
-  enabled = true;
-  await operations.exec(
-    `export TERMIA_MODE_VALUE=ordinary\ncd ${target}`,
-    cwd,
-    { onData: () => {} },
-  );
-  const isolatedOutput: Buffer[] = [];
-  const isolated = await operations.exec(
-    `printf '%s:%s' "\${TERMIA_MODE_VALUE-unset}" "$PWD"`,
-    cwd,
-    { onData: (data) => isolatedOutput.push(data) },
+test("routes SSH Bash through the detached local backend", async () => {
+  const hops: SshHop[] = [{
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "192.168.100.3",
+    port: 22,
+    controlPath: "/tmp/termia-ssh/control",
+  }];
+  const binding = sshWorkspace(hops, "/srv/app", "/tmp/termia-mount");
+  let delegated: { command: string; cwd: string; timeout: number | undefined } | undefined;
+  const local: BashOperations = {
+    exec: async (command, cwd, options) => {
+      delegated = { command, cwd, timeout: options.timeout };
+      options.onData(Buffer.from("remote-output"));
+      return { exitCode: 7 };
+    },
+  };
+  const terminal = {
+    workspace: binding,
+    assertWorkspace: (cwd: string) => assert.equal(cwd, binding.piCwd),
+  } as unknown as TerminalController;
+  const output: Buffer[] = [];
+
+  const result = await createModeBashOperations(() => true, local, terminal).exec(
+    "printf 'hello'\nread value",
+    binding.piCwd,
+    { onData: (data) => output.push(data), timeout: 12 },
   );
 
-  assert.equal(isolated.exitCode, 0);
-  assert.equal(Buffer.concat(isolatedOutput).toString(), `unset:${cwd}`);
-  assert.equal(terminal.running, true);
-
-  await operations.exec(
-    `export TERMIA_MODE_VALUE=quick\ncd ${target}`,
-    cwd,
-    { onData: () => {} },
-  );
-  const quickOutput: Buffer[] = [];
-  const quick = await operations.exec(
-    `printf '%s:%s' "\${TERMIA_MODE_VALUE-unset}" "$PWD"`,
-    cwd,
-    { onData: (data) => quickOutput.push(data) },
-  );
-
-  assert.equal(quick.exitCode, 0);
-  assert.equal(Buffer.concat(quickOutput).toString(), `unset:${cwd}`);
-  assert.equal(history.listCompletedCommands(10).length, 0);
+  assert.equal(result.exitCode, 7);
+  assert.equal(Buffer.concat(output).toString(), "remote-output");
+  assert.equal(delegated?.cwd, binding.piCwd);
+  assert.equal(delegated?.timeout, 12);
+  assert.match(delegated?.command ?? "", /ssh -T -S/);
+  assert.match(delegated?.command ?? "", /\/srv\/app/);
+  assert.doesNotMatch(delegated?.command ?? "", /read value/);
 });
 
 test("aborts only the selected concurrent Agent Bash job", async (t) => {

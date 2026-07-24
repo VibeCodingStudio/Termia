@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import { HistoryStore } from "../extensions/termia/history.ts";
+import { createModeBashOperations } from "../extensions/termia/pty-bash.ts";
 import { TerminalController } from "../extensions/termia/terminal.ts";
 import { workspaceUri, type WorkspaceBinding } from "../extensions/termia/workspace.ts";
 
@@ -158,99 +160,42 @@ test("runs a credential-isolated local -> A -> B -> C workspace chain", { skip: 
     "TERMIA_C_PRIVATE=private-c",
     "termia_c_function() { printf 'function:%s\\n' \"$TERMIA_C_PRIVATE\"; }",
   ].join("; "));
+  const agentBash = createModeBashOperations(() => true, createLocalBashOperations(), controller);
   const firstReady = "/tmp/termia-agent-c-first.ready";
   const secondReady = "/tmp/termia-agent-c-second.ready";
   const gate = "/tmp/termia-agent-c.go";
   await controller.execute(`rm -f ${firstReady} ${secondReady} ${gate}`);
   const historyBeforeAgents = history.listCompletedCommands(200).length;
-  const firstCommand = `: >${firstReady}; while [ ! -f ${gate} ]; do sleep 0.02; done; printf 'first:%s:%s\\n' "$TERMIA_C_PRIVATE" "$PWD"; termia_c_function; cd /`;
-  const secondCommand = `: >${secondReady}; while [ ! -f ${gate} ]; do sleep 0.02; done; printf 'second:%s:%s\\n' "$TERMIA_C_PRIVATE" "$PWD"; termia_c_function`;
+  const firstCommand = `: >${firstReady}; while [ ! -f ${gate} ]; do sleep 0.02; done; printf 'first:%s:%s\\n' "\${TERMIA_C_PRIVATE-unset}" "$PWD"; cd /`;
+  const secondCommand = `: >${secondReady}; while [ ! -f ${gate} ]; do sleep 0.02; done; printf 'second:%s:%s\\n' "\${TERMIA_C_PRIVATE-unset}" "$PWD"`;
   const firstOutput: Buffer[] = [];
   const secondOutput: Buffer[] = [];
-  const firstAgent = controller.executeAgent(firstCommand, { onOutput: (data) => firstOutput.push(data) });
-  const secondAgent = controller.executeAgent(secondCommand, { onOutput: (data) => secondOutput.push(data) });
+  const firstAgent = agentBash.exec(firstCommand, bindingC.piCwd, {
+    onData: (data) => firstOutput.push(data),
+    timeout: 10,
+  });
+  const secondAgent = agentBash.exec(secondCommand, bindingC.piCwd, {
+    onData: (data) => secondOutput.push(data),
+    timeout: 10,
+  });
   const mountedFirstReady = join(bindingC.mountRoot!, firstReady);
   const mountedSecondReady = join(bindingC.mountRoot!, secondReady);
   await waitFor("concurrent Agent jobs on host-c", () =>
     existsSync(mountedFirstReady) && existsSync(mountedSecondReady) ? true : undefined);
   writeFileSync(join(bindingC.mountRoot!, gate), "go");
   assert.deepEqual(await Promise.all([firstAgent, secondAgent]), [{ exitCode: 0 }, { exitCode: 0 }]);
-  assert.match(Buffer.concat(firstOutput).toString(), /first:private-c:\/workspace/);
-  assert.match(Buffer.concat(firstOutput).toString(), /function:private-c/);
-  assert.match(Buffer.concat(secondOutput).toString(), /second:private-c:\/workspace/);
-  assert.match(Buffer.concat(secondOutput).toString(), /function:private-c/);
+  assert.match(Buffer.concat(firstOutput).toString(), /first:unset:\/workspace/);
+  assert.match(Buffer.concat(secondOutput).toString(), /second:unset:\/workspace/);
   assert.equal(controller.cwd, "/workspace");
   assert.equal(history.listCompletedCommands(200).length, historyBeforeAgents);
 
-  const stdinDescriptors = {
-    isTTY: Object.getOwnPropertyDescriptor(process.stdin, "isTTY"),
-    isRaw: Object.getOwnPropertyDescriptor(process.stdin, "isRaw"),
-    setRawMode: Object.getOwnPropertyDescriptor(process.stdin, "setRawMode"),
-  };
-  const stdoutDescriptors = {
-    isTTY: Object.getOwnPropertyDescriptor(process.stdout, "isTTY"),
-    write: Object.getOwnPropertyDescriptor(process.stdout, "write"),
-  };
-  const restore = (target: object, key: string, descriptor: PropertyDescriptor | undefined) => {
-    if (descriptor === undefined) Reflect.deleteProperty(target, key);
-    else Object.defineProperty(target, key, descriptor);
-  };
-  Object.defineProperties(process.stdin, {
-    isTTY: { configurable: true, value: true },
-    isRaw: { configurable: true, writable: true, value: false },
-    setRawMode: {
-      configurable: true,
-      value: (raw: boolean) => Reflect.set(process.stdin, "isRaw", raw),
-    },
-  });
-  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
-  const screen: string[] = [];
-  Object.defineProperty(process.stdout, "write", {
-    configurable: true,
-    value: (chunk: string | Uint8Array): boolean => {
-      screen.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
-      return true;
-    },
-  });
-  let starts = 0;
-  let stops = 0;
-  controller.setUi({
-    custom: (factory: (...args: unknown[]) => unknown) => new Promise((resolve) => {
-      factory({
-        start: () => starts += 1,
-        stop: () => stops += 1,
-        requestRender: () => {},
-      }, undefined, undefined, resolve);
-      setTimeout(() => process.stdin.emit("data", Buffer.from("alpha\rbeta\r")), 50);
-    }),
-  } as Parameters<TerminalController["setUi"]>[0]);
   const interactiveOutput: Buffer[] = [];
-  const interactiveCommand = [
-    "printf 'remote:first?\\n'",
-    "read -r first",
-    "printf 'remote:second?\\n'",
-    "read -r second",
-    "printf 'remote:%s:%s\\n' \"$first\" \"$second\"",
-  ].join("; ");
-  try {
-    const interactive = await controller.executeAgent(interactiveCommand, {
-      signal: AbortSignal.timeout(10_000),
-      onOutput: (data) => interactiveOutput.push(data),
-    });
-    assert.equal(interactive.exitCode, 0);
-  } finally {
-    controller.setUi(undefined);
-    process.stdin.pause();
-    restore(process.stdin, "isTTY", stdinDescriptors.isTTY);
-    restore(process.stdin, "isRaw", stdinDescriptors.isRaw);
-    restore(process.stdin, "setRawMode", stdinDescriptors.setRawMode);
-    restore(process.stdout, "isTTY", stdoutDescriptors.isTTY);
-    restore(process.stdout, "write", stdoutDescriptors.write);
-  }
-  assert.match(Buffer.concat(interactiveOutput).toString(), /remote:alpha:beta/);
-  assert.match(screen.join(""), /remote:first\?/);
-  assert.equal(starts, 1);
-  assert.equal(stops, 1);
+  const interactiveCommand = "test ! -t 0 && ! IFS= read -r value && printf 'remote:eof\\n'";
+  assert.deepEqual(await agentBash.exec(interactiveCommand, bindingC.piCwd, {
+    onData: (data) => interactiveOutput.push(data),
+    timeout: 10,
+  }), { exitCode: 0 });
+  assert.equal(Buffer.concat(interactiveOutput).toString(), "remote:eof\n");
   assert.equal(history.listCompletedCommands(200).length, historyBeforeAgents);
 
   const manualC = await controller.execute("printf 'manual-c:%s\\n' \"$PWD\"");
@@ -263,7 +208,7 @@ test("runs a credential-isolated local -> A -> B -> C workspace chain", { skip: 
     || record.command === interactiveCommand), false);
   assert.doesNotMatch(
     recordsAfterC.map((record) => history.readOutput(record)).join("\n"),
-    /first:private-c|second:private-c|remote:first\?|remote:alpha:beta/,
+    /first:unset|second:unset|remote:eof/,
   );
 
   compose(["stop", "host-c"]);

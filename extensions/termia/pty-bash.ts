@@ -1,4 +1,5 @@
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
+import { buildRemoteBashCommand } from "./ssh-workspace.ts";
 import { TerminalController } from "./terminal.ts";
 
 export function createPtyBashOperations(
@@ -55,36 +56,12 @@ export function createModeBashOperations(
   return {
     exec: async (command, cwd, options) => {
       if (!enabled()) return local.exec(command, cwd, options);
-      const { onData, signal, timeout } = options;
-      const executionAbort = new AbortController();
-      let timedOut = false;
-      const abort = () => executionAbort.abort();
-      if (signal?.aborted) abort();
-      else signal?.addEventListener("abort", abort, { once: true });
-      const timer = timeout === undefined
-        ? undefined
-        : setTimeout(() => {
-            timedOut = true;
-            executionAbort.abort();
-          }, timeout * 1000);
-      try {
-        if (!terminal.running) terminal.start(cwd);
-        terminal.assertWorkspace(cwd);
-        const result = await terminal.executeAgent(command, {
-          signal: executionAbort.signal,
-          onOutput: onData,
-        });
-        if (signal?.aborted) throw new Error("aborted");
-        if (timedOut) throw new Error(`timeout:${timeout}`);
-        return result;
-      } catch (error) {
-        if (signal?.aborted) throw new Error("aborted");
-        if (timedOut) throw new Error(`timeout:${timeout}`);
-        throw error;
-      } finally {
-        if (timer !== undefined) clearTimeout(timer);
-        signal?.removeEventListener("abort", abort);
-      }
+      terminal.assertWorkspace(cwd);
+      const binding = terminal.workspace;
+      const resolved = binding.target.scheme === "ssh"
+        ? buildRemoteBashCommand(binding.target.hops, binding.target.path, command)
+        : command;
+      return local.exec(resolved, cwd, options);
     },
   };
 }

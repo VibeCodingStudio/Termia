@@ -96,24 +96,20 @@ synchronous path in the persistent Termia PTY, alongside manual commands, `!`,
 and `!!`. It therefore shares the shell's live cwd, variables, aliases, and
 functions and remains part of that quick ask's Termia history.
 
-While Termia mode is enabled, ordinary Pi `bash` instead forks an isolated
-background subshell from the exact current Termia shell. It inherits the cwd,
-exported and unexported variables, functions, aliases, shell options, and active
-virtual environment at launch. Its assignments, option changes, and `cd` do not
-change the parent shell. Multiple non-interactive Agent commands can run
-concurrently, and their commands, helper traffic, prompts, and output are not
-written to Termia history. When the mode is disabled, the same Pi-generated tool
-definition delegates to Pi's local bash backend.
-Termia delegates the tool schema, output truncation, and Agent loop to Pi and
-only supplies the PTY execution operation.
+While Termia mode is enabled, ordinary Pi `bash` uses Pi's detached,
+non-interactive Bash backend. Local commands start in the active workspace cwd;
+SSH commands reuse the authenticated Termia `ControlMaster` chain with `ssh -T`
+and start in the active logical remote cwd. Multiple commands can run
+concurrently, but they do not inherit aliases, functions, unexported variables,
+jobs, or other process-local state from the interactive Termia shell. Their
+assignments and `cd` also do not change that shell.
 
-If an ordinary Agent `bash` command waits for terminal input, Termia opens an
-input view automatically. Terminal echo controls whether input is visible, so
-password prompts mask naturally while confirmations and other input remain
-visible. If several commands are waiting, choose one with Up/Down and Enter.
-Repeated prompts stay in the selected view; press `Ctrl+G` to return to the job
-menu. `Ctrl+]` is unavailable while the Agent is running. Use the main `/termia`
-terminal for full-screen interactive programs.
+Ordinary Agent Bash receives no interactive stdin or controlling terminal.
+Commands that require a password, confirmation, or `/dev/tty` therefore fail
+normally instead of blocking; use the main `/termia` terminal for interactive
+work. When Termia mode is disabled, Bash continues to use Pi's local backend.
+Termia delegates the tool schema, output truncation, timeout, cancellation, and
+Agent loop to Pi.
 
 Quick asks use Pi's native print behavior: Termia stays silent while Pi thinks
 and runs tools, then prints only the final answer or final error. Detached mode

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { SshOpenEvent } from "../extensions/termia/protocol.ts";
 import {
-  buildRemoteExecCommand,
+  buildRemoteBashCommand,
   buildSftpBridgeScript,
   prepareWorkspaceMountPath,
   SshChain,
@@ -95,22 +95,19 @@ test("builds an SFTP relay through control sockets owned by each parent", () => 
   assert.doesNotMatch(script, /IdentityFile|private.key|reconnect/);
 });
 
-test("builds nested process-group signals through existing control sockets", async () => {
-  const command = buildRemoteExecCommand(hops, "kill -INT -4123");
-  assert.match(command, /\/tmp\/termia-a\/control/);
-  assert.match(command, /host-a/);
-  assert.match(command, /\/tmp\/termia-b\/control/);
-  assert.match(command, /host-b/);
-  assert.match(command, /kill -INT -4123/);
+test("builds non-interactive remote Bash through existing control sockets", () => {
+  const command = buildRemoteBashCommand(hops, "/srv/app dir", "printf 'one\\ntwo'\nread value");
 
-  const chain = new SshChain(fileWorkspace("/work/project"), "local", new FakeMounts());
-  chain.open(openA);
-  await assert.rejects(chain.signalProcessGroup("missing", 4123, "INT"), /Unknown SSH shell/);
-  await assert.rejects(chain.signalProcessGroup("shell-a", 0, "INT"), /Invalid Agent process group/);
-  await assert.rejects(
-    chain.signalProcessGroup("shell-a", 4123, "TERM" as "INT"),
-    /Invalid Agent signal/,
-  );
+  assert.match(command, /ssh -T -S '\/tmp\/termia-a\/control'/);
+  assert.match(command, /ssh -T -S .*\/tmp\/termia-b\/control/);
+  assert.match(command, /exec ssh -T -S/);
+  assert.doesNotMatch(command, /exec cd --/);
+  assert.match(command, /cd -- .*\/srv\/app dir/);
+  assert.match(command, /base64 -d/);
+  assert.match(command, /ucode/);
+  assert.doesNotMatch(command, /printf 'one\\ntwo'/);
+  assert.throws(() => buildRemoteBashCommand(hops, "relative", "true"), /absolute/);
+  assert.throws(() => buildRemoteBashCommand(hops, "/srv/app", "bad\0command"), /NUL/);
 });
 
 test("names mount directories by hop depth and leaf identity", () => {

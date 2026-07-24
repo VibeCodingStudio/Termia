@@ -20,24 +20,40 @@
     "url": "https://github.com/VibeCodingStudio/Termia/issues"
   },
   "type": "module",
-  "files": ["extensions", "assets", "README.md", "LICENSE"],
-  "engines": { "node": ">=22.19.0" },
+  "files": [
+    "extensions",
+    "assets",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "pi": {
-    "extensions": ["./extensions/termia/index.ts"],
+    "extensions": [
+      "./extensions/termia/index.ts"
+    ],
     "image": "https://raw.githubusercontent.com/VibeCodingStudio/Termia/main/assets/termia-preview.png"
   },
   "scripts": {
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": { "node-pty": "1.2.0-beta.13", "typebox": "1.1.38" },
+  "dependencies": {
+    "node-pty": "1.2.0-beta.13",
+    "typebox": "1.1.38"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": { "optional": true },
-    "@earendil-works/pi-tui": { "optional": true }
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.10",

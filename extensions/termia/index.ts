@@ -78,6 +78,7 @@ type TermiaRuntime = {
   terminal: TerminalController;
   editorFactory: EditorFactory | undefined;
   attachedTurn: AttachedTurn | undefined;
+  agentActive: boolean;
   quickAskActive: boolean;
   piCwd: string;
   binding: WorkspaceBinding;
@@ -117,6 +118,7 @@ function runtime(): TermiaRuntime {
       terminal: new TerminalController(history),
       editorFactory: undefined,
       attachedTurn: undefined,
+      agentActive: false,
       quickAskActive: false,
       piCwd: binding.piCwd,
       binding,
@@ -173,7 +175,7 @@ function bangContextText(data: BangResultData): string {
     ? "(no output)"
     : `\`\`\`\n${data.output}\n\`\`\``;
   const truncation = data.truncated
-    ? "\n\n[Output truncated. Use /termia-history for the full transcript.]"
+    ? "\n\n[Output truncated. Use /history for the full transcript.]"
     : "";
   return `Ran \`${data.command}\` in the persistent Termia shell\n${output}\n\nExit code: ${data.exitCode}\nWorking directory: ${data.cwd}${truncation}`;
 }
@@ -554,8 +556,8 @@ async function toggleTermiaMode(
             notifySwitched = () => {
               replacementCtx.ui.notify(
                 state.shortcutHintShown
-                  ? "Termia enabled"
-                  : "Termia enabled · Ctrl+] switches between Agent and PTY",
+                  ? "Termia enabled · /history opens command history"
+                  : "Termia enabled · /history opens command history · Ctrl+] switches between Agent and PTY",
                 "info",
               );
               state.shortcutHintShown = true;
@@ -626,6 +628,10 @@ export default function termia(pi: ExtensionAPI): void {
     return { systemPrompt: presentWorkspaceCwd(event.systemPrompt, state.binding) };
   });
 
+  pi.on("agent_start", () => {
+    state.agentActive = true;
+  });
+
   pi.on("message_end", (event) => {
     const turn = state.attachedTurn;
     if (turn === undefined || event.message.role !== "assistant") return;
@@ -642,6 +648,7 @@ export default function termia(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_settled", () => {
+    state.agentActive = false;
     const turn = state.attachedTurn;
     if (turn === undefined) return;
     finishAttachedTurn(state, {
@@ -676,7 +683,7 @@ export default function termia(pi: ExtensionAPI): void {
       (draft) => {
         state.editorDraft = draft;
       },
-      () => ctx.isIdle(),
+      () => !state.agentActive,
     );
     restoreEditorDraft(ctx, state);
     if (!state.enabled) {

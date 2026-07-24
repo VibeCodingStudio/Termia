@@ -28,9 +28,11 @@ The Termia editor handles the shortcut according to active-session state:
 - Termia enabled and Agent busy: consume the key silently and submit nothing.
 - Termia enabled and Agent idle: preserve the draft and enter the PTY as today.
 
-The editor receives the public `ctx.isIdle()` state from the current
-`session_start` context. A consumed busy-state key is not queued, replayed,
-converted into `/termia __terminal`, or accompanied by a notification.
+The editor reads Agent activity tracked from Pi's `agent_start` and
+`agent_settled` events on the shared Termia runtime. This stays current when Pi
+reuses the editor factory across session switches. A consumed busy-state key is
+not queued, replayed, converted into `/termia __terminal`, or accompanied by a
+notification.
 
 ## Entry hint
 

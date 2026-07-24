@@ -89,7 +89,7 @@ export function renderBangResult(data: BangResultData, theme: BangTheme): Compon
   const status = `exit ${data.exitCode} · ${data.durationMs}ms · ${data.cwd}`;
   lines.push(theme.fg(data.exitCode === 0 ? "success" : "error", status));
   if (data.truncated) {
-    lines.push(theme.fg("dim", "Output truncated · use /termia-history for the full transcript"));
+    lines.push(theme.fg("dim", "Output truncated · use /history for the full transcript"));
   }
   return new Text(lines.join("\n"));
 }

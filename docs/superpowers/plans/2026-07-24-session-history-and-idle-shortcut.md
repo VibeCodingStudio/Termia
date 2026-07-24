@@ -26,7 +26,7 @@
 - Modify: `extensions/termia/index.ts`
 
 **Interfaces:**
-- Consumes: `ExtensionContext.isIdle(): boolean` from the active `session_start` context.
+- Consumes: Pi's `agent_start` and `agent_settled` extension events.
 - Produces: `BangEditor`'s existing `Ctrl+]` behavior gated by a new idle predicate.
 
 - [ ] **Step 1: Add the failing busy-shortcut test**
@@ -100,7 +100,9 @@ if (this.#enabled() && matchesKey(data, "ctrl+]")) {
 }
 ```
 
-Pass `() => ctx.isIdle()` from the active `session_start` handler through `installBangEditor`.
+Track Agent activity on the shared Termia runtime and pass
+`() => !state.agentActive` through `installBangEditor`. This avoids retaining a
+stale session context when Pi reuses the editor factory after a session switch.
 
 - [ ] **Step 4: Run the focused test and verify GREEN**
 
@@ -220,7 +222,7 @@ Document that busy `Ctrl+]` is discarded rather than deferred.
 Run:
 
 ```bash
-rg -n 'termia-history' README.md extensions test
+rg -n '/termia-history' README.md extensions test
 ```
 
 Expected: no matches. Historical design and plan documents are not rewritten.

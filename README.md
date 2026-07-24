@@ -40,7 +40,7 @@ press `Ctrl+]` to switch between Pi and the persistent terminal.
 Ctrl+]            switch between Agent and the persistent shell while the Agent is idle
 !command          run in the persistent shell and include the result in Agent context
 !!command         run in the persistent shell without adding the result to Agent context
-/termia-history   open recorded command history
+/history          open recorded command history while Termia is enabled
 ```
 
 Enabling `/termia` remembers the current Pi session and opens a fresh,
@@ -48,9 +48,12 @@ empty session under Termia-managed storage. Native `/new`, `/resume`, and
 `/fork` then stay in that storage. Running `/termia` again disables the
 mode and returns to the exact session that was active before enabling it.
 Termia mode is never persisted and starts disabled in every new Pi process.
-On first entry, Pi shows a reminder that `Ctrl+]` switches between Agent and
-the persistent shell while the Agent is idle. Any unfinished Agent prompt is
-preserved across the switch.
+Inside its managed session, `/history` appears in command completion. On first
+entry, Pi shows a reminder for `/history` and that `Ctrl+]` switches between
+Agent and the persistent shell while the Agent is idle. Later entries still
+remind you about `/history`. Any unfinished Agent prompt is preserved across
+an idle switch. While the Agent is running, `Ctrl+]` is consumed silently and
+is never queued for a delayed switch.
 
 Enabling Termia also activates fixed operational guidance for evidence-first
 troubleshooting, local and SSH workspace boundaries, nested SSH identity, and
@@ -61,11 +64,8 @@ working directory with the current logical `ssh://` URI so `cd` and nested SSH
 handoffs remain accurate.
 
 While disabled, Pi's `bash`, `!`, and `!!` retain their native behavior,
-`termia_history` is inactive, and `/termia` or `/termia-history` reports:
-
-```text
-Termia is disabled; run /termia to enable it
-```
+`termia_history` is inactive, and `/history` is not registered. `/termia`
+remains available to enable the mode.
 
 The persistent shell prompt starts with `[termia]`, so it remains visible after
 scrolling. A Pi process launched from that shell keeps its native `!` behavior;
@@ -133,7 +133,7 @@ print mode without persistence. Pi session-selection/lifecycle options,
 During a quick ask, `Ctrl+C` aborts it and returns status 130 to the shell.
 `Ctrl+]` is ignored until the quick ask finishes, leaving the shell reusable.
 
-In `/termia-history`, use Up/Down to move, Space to select multiple commands,
+In `/history`, use Up/Down to move, Space to select multiple commands,
 Pi's configured tool-output expansion key (`Ctrl+O` by default) to preview the
 active command, and Enter to place the selected command metadata in the editor.
 The metadata includes the command, cwd, exit code, time, duration, and stable
@@ -167,7 +167,7 @@ physical SSHFS mount for its built-in read/edit/write/grep/find/ls tools,
 status expose only the logical URI such as `ssh://user@host/srv/app`. Absolute
 file paths map to the remote root; relative paths use the remote cwd. Use an absolute path
 instead of `~` in file tools. Agent bash is forked by that same remote shell and
-remains outside `/termia-history`; manual commands, `!`, and `!!` retain their
+remains outside `/history`; manual commands, `!`, and `!!` retain their
 SSH workspace provenance.
 
 The local machine needs `sshfs` and `fusermount3` (macOS uses `umount`). If
@@ -207,7 +207,7 @@ or migrated.
 - Linux, WSL2, and macOS
 - bash, zsh, BusyBox ash, and BusyBox sh interactive shells
 - Pi TUI mode with a persisted session
-- bounded bang results in the Pi session; full raw output remains available through `/termia-history`
+- bounded bang results in the Pi session; full raw output remains available through `/history`
 - with Termia mode enabled, Agent `bash` uses the persistent PTY directly during `termia ...` and `termia --attach`; ordinary Pi bash uses concurrent isolated child jobs and stays outside Termia history
 
 ## Uninstall

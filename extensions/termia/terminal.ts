@@ -6,29 +6,20 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type IDisposable, type IPty } from "node-pty";
 import type { CommandRecord } from "./history.ts";
 import { HistoryStore } from "./history.ts";
-import { ProtocolParser, type ProtocolToken, type QuickAskRequest } from "./protocol.ts";
+import { ProtocolParser, type ProtocolToken } from "./protocol.ts";
 import { SshChain, type MountOperations } from "./ssh-workspace.ts";
 import { fileWorkspace, type WorkspaceBinding } from "./workspace.ts";
 
 type TerminalContext = Pick<ExtensionCommandContext, "ui">;
 type CommandListener = (command: CommandRecord) => void;
-type QuickAskListener = (request: QuickAskRequest) => void;
 type PromptBoundary = { cwd: string; outputOffset: number };
-export type TerminalAttachExit =
-  | { type: "detach"; shellId: string }
-  | { type: "quickAsk"; request: QuickAskRequest };
-export type TerminalEnterOptions = {
-  refresh?: boolean;
-  onQuickAskAbort?: () => void;
-};
+export type TerminalAttachExit = { type: "detach"; shellId: string };
 export type ExecuteOptions = {
-  isolated?: boolean;
   onOutput?: (data: string) => void;
   signal?: AbortSignal;
 };
 type ActiveExecution = {
   command: string;
-  isolated: boolean;
   sequence: { shellId: string; value: number } | undefined;
   written: boolean;
   aborting: boolean;
@@ -64,16 +55,12 @@ export function isTermiaPty(marker = process.env.TERMIA_PTY): boolean {
 export class TerminalController {
   private readonly parser = new ProtocolParser();
   private readonly listeners = new Set<CommandListener>();
-  private readonly quickAskListeners = new Set<QuickAskListener>();
   private readonly history: HistoryStore;
   private readonly sshChain: SshChain;
   private subscriptions: IDisposable[] = [];
   private pty: IPty | undefined;
   private execution: ActiveExecution | undefined;
   private detach: ((result: TerminalAttachExit) => void) | undefined;
-  private resumeTui: (() => void) | undefined;
-  private activeQuickAsk: QuickAskRequest | undefined;
-  private quickAskControlExited = false;
   private attached = false;
   private shellReady = false;
   private cwdValue = process.cwd();
@@ -178,9 +165,7 @@ export class TerminalController {
     if (command.trim().length === 0) throw new Error("Termia command cannot be empty");
     if (command.includes("\u0000")) throw new Error("Termia command cannot contain NUL bytes");
     if (this.pty === undefined) throw new Error("Termia shell is not running");
-    if (this.attached && this.activeQuickAsk === undefined) {
-      throw new Error("Termia terminal is attached");
-    }
+    if (this.attached) throw new Error("Termia terminal is attached");
     if (this.execution !== undefined) throw new Error("A Termia command is already running");
     options.signal?.throwIfAborted();
 
@@ -198,7 +183,6 @@ export class TerminalController {
       };
       const execution: ActiveExecution = {
         command,
-        isolated: options.isolated === true,
         sequence: undefined,
         written: false,
         aborting: false,
@@ -227,40 +211,11 @@ export class TerminalController {
     return () => this.listeners.delete(listener);
   }
 
-  onQuickAsk(listener: QuickAskListener): () => void {
-    this.quickAskListeners.add(listener);
-    return () => this.quickAskListeners.delete(listener);
-  }
-
-  completeQuickAsk(exitCode: number, output = ""): void {
-    if (this.activeQuickAsk === undefined) throw new Error("No Termia quick ask is active");
-    if (!Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255) {
-      throw new Error("Quick ask exit code must be an integer between 0 and 255");
-    }
-    if (output.length > 0) this.history.appendOutput(output);
-    const execution = this.execution;
-    if (execution !== undefined) {
-      if (execution.sequence !== undefined) this.pty?.write("\u0003");
-      this.clearExecution(execution);
-      execution.reject(new Error("Termia quick ask ended while a command was running"));
-    }
-    this.activeQuickAsk = undefined;
-    if (this.quickAskControlExited) {
-      this.quickAskControlExited = false;
-      this.write("\r");
-      return;
-    }
-    this.shellReady = false;
-    this.write(`D;${exitCode}\r`);
-  }
-
-  async enter(ctx: TerminalContext, options: TerminalEnterOptions = {}): Promise<TerminalAttachExit> {
+  async enter(ctx: TerminalContext): Promise<TerminalAttachExit> {
     if (this.pty === undefined) {
-      this.resumeUi();
       throw new Error("Termia shell is not running");
     }
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      this.resumeUi();
       throw new Error("Termia terminal mode requires a TTY");
     }
     if (this.attached) throw new Error("Termia terminal is already attached");
@@ -270,11 +225,7 @@ export class TerminalController {
       return await ctx.ui.custom<TerminalAttachExit>((tui, _theme, _keys, done) => {
         const previousRawMode = process.stdin.isRaw;
         let finished = false;
-        let resumed = false;
         const resume = () => {
-          if (resumed) return;
-          resumed = true;
-          if (this.resumeTui === resume) this.resumeTui = undefined;
           tui.start();
           tui.requestRender(true);
         };
@@ -290,17 +241,12 @@ export class TerminalController {
           try {
             process.stdin.setRawMode(previousRawMode);
           } finally {
-            if (result.type === "quickAsk") this.resumeTui = resume;
-            else resume();
+            resume();
             done(result);
           }
         };
         const onInput = (chunk: Buffer | string) => {
           const data = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-          if (this.activeQuickAsk !== undefined) {
-            if (data.includes(0x03)) options.onQuickAskAbort?.();
-            return;
-          }
           const escape = data.indexOf(0x1d);
           if (escape < 0) {
             this.write(data);
@@ -315,15 +261,14 @@ export class TerminalController {
 
         try {
           tui.stop();
-          this.resumeTui = undefined;
-          if (options.refresh !== false) process.stdout.write("\u001b[2J\u001b[H");
+          process.stdout.write("\u001b[2J\u001b[H");
           process.stdin.setRawMode(true);
           process.stdin.on("data", onInput);
           process.stdin.resume();
           process.on("SIGWINCH", onResize);
           this.detach = finish;
           onResize();
-          if (options.refresh !== false) this.pty?.write("\u000c");
+          this.pty?.write("\u000c");
         } catch (error) {
           finish();
           throw error;
@@ -333,13 +278,8 @@ export class TerminalController {
       });
     } catch (error) {
       this.attached = false;
-      this.resumeUi();
       throw error;
     }
-  }
-
-  resumeUi(): void {
-    this.resumeTui?.();
   }
 
   dispose(): void {
@@ -349,7 +289,6 @@ export class TerminalController {
       this.finish(child);
     }
     void this.sshChain.dispose();
-    this.resumeUi();
   }
 
   async disposeWorkspaces(): Promise<void> {
@@ -367,9 +306,7 @@ export class TerminalController {
         if (this.execution?.sequence !== undefined) {
           this.execution.onOutput?.(token.data);
         }
-        if (this.attached && this.activeQuickAsk === undefined) {
-          process.stdout.write(token.data);
-        }
+        if (this.attached) process.stdout.write(token.data);
         break;
       case "ready":
         this.activeShellId = token.shellId;
@@ -387,12 +324,8 @@ export class TerminalController {
         if (
           this.execution?.aborting
           && this.execution.sequence !== undefined
-          && (
-            this.activeQuickAsk !== undefined
-            || this.explicitExecutionShells.has(token.shellId)
-          )
+          && this.explicitExecutionShells.has(token.shellId)
         ) {
-          this.quickAskControlExited = true;
           this.consumeToken({
             type: "end",
             shellId: this.execution.sequence.shellId,
@@ -435,7 +368,6 @@ export class TerminalController {
             && this.execution.sequence.value === token.sequence
           ) {
             const execution = this.execution;
-            if (this.activeQuickAsk !== undefined) this.shellReady = true;
             this.clearExecution(execution);
             execution.resolve(command);
           }
@@ -462,16 +394,6 @@ export class TerminalController {
         for (const listener of this.listeners) listener(command);
         break;
       }
-      case "quickAsk":
-        if (this.activeQuickAsk !== undefined) break;
-        this.activeShellId = token.shellId;
-        this.cwdValue = token.cwd;
-        this.activeQuickAsk = token;
-        this.quickAskControlExited = false;
-        this.shellReady = true;
-        for (const listener of this.quickAskListeners) listener(this.activeQuickAsk);
-        this.detach?.({ type: "quickAsk", request: this.activeQuickAsk });
-        break;
       case "sshOpen":
         try {
           this.sshChain.open(token);
@@ -507,8 +429,6 @@ export class TerminalController {
     this.subscriptions = [];
     this.pty = undefined;
     this.shellReady = false;
-    this.activeQuickAsk = undefined;
-    this.quickAskControlExited = false;
     this.activeShellId = "local";
     this.shellParents.clear();
     this.explicitExecutionShells.clear();
@@ -523,7 +443,6 @@ export class TerminalController {
       execution.reject(new Error("Termia shell exited while a command was running"));
     }
     this.detach?.({ type: "detach", shellId: this.activeShellId });
-    this.resumeUi();
   }
 
   private clearExecution(execution: ActiveExecution): void {
@@ -535,22 +454,16 @@ export class TerminalController {
     if (this.execution !== execution || execution.written) return;
     execution.written = true;
     this.shellReady = false;
-    const command = execution.isolated ? `(${execution.command})` : execution.command;
-    if (this.activeQuickAsk === undefined) {
-      if (this.explicitExecutionShells.has(this.activeShellId)) {
-        const encoded = Buffer.from(command, "utf8").toString("base64");
-        this.pty?.write("__termia_exec_stream\r");
-        for (let offset = 0; offset < encoded.length; offset += EXPLICIT_EXEC_CHUNK_SIZE) {
-          const chunk = encoded.slice(offset, offset + EXPLICIT_EXEC_CHUNK_SIZE);
-          this.pty?.write(`${chunk}\r`);
-        }
-        this.pty?.write(".\r");
-      } else {
-        this.pty?.write(`eval -- ${shellQuote(command)}\r`);
+    if (this.explicitExecutionShells.has(this.activeShellId)) {
+      const encoded = Buffer.from(execution.command, "utf8").toString("base64");
+      this.pty?.write("__termia_exec_stream\r");
+      for (let offset = 0; offset < encoded.length; offset += EXPLICIT_EXEC_CHUNK_SIZE) {
+        const chunk = encoded.slice(offset, offset + EXPLICIT_EXEC_CHUNK_SIZE);
+        this.pty?.write(`${chunk}\r`);
       }
-      return;
+      this.pty?.write(".\r");
+    } else {
+      this.pty?.write(`eval -- ${shellQuote(execution.command)}\r`);
     }
-    const encoded = Buffer.from(command, "utf8").toString("base64");
-    this.pty?.write(`X;${encoded}\r`);
   }
 }

@@ -1,4 +1,3 @@
-import { fileURLToPath } from "node:url";
 import type {
   BashOperations,
   ExtensionAPI,
@@ -32,14 +31,6 @@ import {
 } from "./mode.ts";
 import { createModeBashOperations } from "./pty-bash.ts";
 import {
-  buildQuickMessages,
-  parseQuickAskArguments,
-  selectQuickHistory,
-  type QuickAskInvocation,
-} from "./quick-ask.ts";
-import { runQuickPrint, type QuickPrintResult } from "./quick-runtime.ts";
-import type { QuickAskRequest } from "./protocol.ts";
-import {
   handoffSession,
   isManagedSession,
   releaseManagedSession,
@@ -49,24 +40,14 @@ import {
 import {
   isTermiaPty,
   TerminalController,
-  type TerminalAttachExit,
 } from "./terminal.ts";
 import {
   applyWorkspaceToolPolicy,
   fileWorkspace,
   presentWorkspaceCwd,
-  projectWorkspacePath,
   workspaceUri,
   type WorkspaceBinding,
 } from "./workspace.ts";
-
-type AttachedTurn = {
-  output: string;
-  exitCode: number;
-  aborted: boolean;
-  abort: () => void;
-  finish: (result: QuickPrintResult) => void;
-};
 
 type TermiaRuntime = {
   api: ExtensionAPI | undefined;
@@ -77,19 +58,10 @@ type TermiaRuntime = {
   history: HistoryStore;
   terminal: TerminalController;
   editorFactory: EditorFactory | undefined;
-  attachedTurn: AttachedTurn | undefined;
   agentActive: boolean;
-  quickAskActive: boolean;
   piCwd: string;
   binding: WorkspaceBinding;
 };
-
-type ActiveTerminalContext = {
-  ctx: ExtensionCommandContext;
-  sendUserMessage: UserMessageSender;
-};
-
-type UserMessageSender = (message: string) => void | Promise<void>;
 
 type BangExecutionOutcome =
   | { type: "success"; record: CommandRecord }
@@ -101,7 +73,6 @@ declare global {
 
 const ROOT = termiaRoot(getAgentDir());
 const BANG_RESULT_TYPE = "termia.command";
-const TERMIA_EXTENSION_PATH = fileURLToPath(import.meta.url);
 const TERMIA_DISABLED_NOTICE = "Termia is disabled; run /termia to enable it";
 
 function runtime(): TermiaRuntime {
@@ -117,9 +88,7 @@ function runtime(): TermiaRuntime {
       history,
       terminal: new TerminalController(history),
       editorFactory: undefined,
-      attachedTurn: undefined,
       agentActive: false,
-      quickAskActive: false,
       piCwd: binding.piCwd,
       binding,
     };
@@ -183,17 +152,12 @@ function bangContextText(data: BangResultData): string {
 async function enterTerminal(
   ctx: ExtensionCommandContext,
   state: TermiaRuntime,
-  sendUserMessage: UserMessageSender,
 ): Promise<void> {
   if (state.terminal.running && !state.terminal.isWorkspaceHealthy(state.binding)) {
     const binding = state.terminal.nearestLiveWorkspace();
     const result = await handoffWorkspace(ctx, state, binding, {
       withSession: async (replacementCtx) => {
-        await enterTerminal(
-          replacementCtx,
-          state,
-          (message) => replacementCtx.sendUserMessage(message),
-        );
+        await enterTerminal(replacementCtx, state);
       },
     });
     if (result.switched) return;
@@ -203,212 +167,22 @@ async function enterTerminal(
     }
   }
   if (!state.terminal.running) state.terminal.start(ctx.cwd);
-  try {
-    await terminalLoop(state, {
-      ctx,
-      sendUserMessage,
-    });
-  } catch (error) {
-    state.terminal.resumeUi();
-    throw error;
-  }
-}
-
-function finishAttachedTurn(state: TermiaRuntime, result: QuickPrintResult): void {
-  const turn = state.attachedTurn;
-  if (turn === undefined) return;
-  state.attachedTurn = undefined;
-  turn.finish(result);
-}
-
-function attachedTurn(
-  state: TermiaRuntime,
-  active: ActiveTerminalContext,
-  message: string,
-  signal: AbortSignal,
-): Promise<QuickPrintResult> {
-  if (state.attachedTurn !== undefined) throw new Error("A Termia attached quick ask is already running");
-  if (signal.aborted) return Promise.resolve({ exitCode: 130, output: "Request aborted\n" });
-
-  return new Promise((resolveTurn, rejectTurn) => {
-    const abort = () => {
-      const turn = state.attachedTurn;
-      if (turn === undefined) return;
-      turn.aborted = true;
-      active.ctx.abort();
-    };
-    const finish = (result: QuickPrintResult) => {
-      signal.removeEventListener("abort", abort);
-      resolveTurn(result);
-    };
-    state.attachedTurn = {
-      output: "",
-      exitCode: 0,
-      aborted: false,
-      abort,
-      finish,
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    try {
-      void Promise.resolve(active.sendUserMessage(message)).catch((error: unknown) => {
-        if (state.attachedTurn?.abort !== abort) return;
-        state.attachedTurn = undefined;
-        signal.removeEventListener("abort", abort);
-        rejectTurn(error);
-      });
-    } catch (error) {
-      state.attachedTurn = undefined;
-      signal.removeEventListener("abort", abort);
-      rejectTurn(error);
-    }
-  });
-}
-
-async function runAttachedQuickAsk(
-  state: TermiaRuntime,
-  active: ActiveTerminalContext,
-  messages: readonly string[],
-  signal: AbortSignal,
-): Promise<QuickPrintResult> {
-  let result: QuickPrintResult = { exitCode: 0, output: "" };
-  for (const message of messages) {
-    result = await attachedTurn(state, active, message, signal);
-    if (result.exitCode !== 0) break;
-  }
-  return result;
-}
-
-function quickError(error: unknown): QuickPrintResult {
-  return { exitCode: 1, output: `termia: ${errorMessage(error)}\n` };
-}
-
-async function answerQuickAsk(
-  state: TermiaRuntime,
-  active: ActiveTerminalContext,
-  request: QuickAskRequest,
-  invocation: QuickAskInvocation,
-  messages: readonly string[],
-): Promise<TerminalAttachExit> {
-  const abortController = new AbortController();
-  const attachment = state.terminal.enter(active.ctx, {
-    refresh: false,
-    onQuickAskAbort: () => abortController.abort(),
-  });
-  state.quickAskActive = true;
-  let result: QuickPrintResult;
-  try {
-    if (invocation.attach) {
-      result = await runAttachedQuickAsk(state, active, messages, abortController.signal);
-      if (result.output.length > 0) process.stdout.write(result.output);
-    } else {
-      const binding = await state.terminal.readyWorkspace(request.shellId);
-      const physicalRequest: QuickAskRequest = {
-        ...request,
-        cwd: binding.target.scheme === "ssh"
-          ? projectWorkspacePath(binding, request.cwd)
-          : request.cwd,
-      };
-      result = await runQuickPrint(
-        physicalRequest,
-        invocation,
-        messages,
-        state.history,
-        state.terminal,
-        {
-          agentDir: getAgentDir(),
-          projectTrusted: active.ctx.isProjectTrusted(),
-          termiaExtensionPath: TERMIA_EXTENSION_PATH,
-          binding,
-        },
-        abortController.signal,
-      );
-    }
-  } catch (error) {
-    result = quickError(error);
-    process.stderr.write(result.output);
-  } finally {
-    state.quickAskActive = false;
-  }
-  state.terminal.completeQuickAsk(result.exitCode, result.output);
-  return attachment;
+  await terminalLoop(state, ctx);
 }
 
 async function terminalLoop(
   state: TermiaRuntime,
-  active: ActiveTerminalContext,
-  initialRequest?: QuickAskRequest,
+  ctx: ExtensionCommandContext,
 ): Promise<void> {
-  let exit: TerminalAttachExit = initialRequest === undefined
-    ? await state.terminal.enter(active.ctx)
-    : { type: "quickAsk", request: initialRequest };
-
-  while (exit.type === "quickAsk") {
-    const request = exit.request;
-    let invocation: QuickAskInvocation;
-    let messages: string[];
-    try {
-      invocation = parseQuickAskArguments(request.argv);
-      messages = buildQuickMessages(
-        invocation.piArgs.messages,
-        selectQuickHistory(state.history, invocation.history),
-      );
-    } catch (error) {
-      const attachment = state.terminal.enter(active.ctx, { refresh: false });
-      const result = quickError(error);
-      process.stderr.write(result.output);
-      state.terminal.completeQuickAsk(2, result.output);
-      exit = await attachment;
-      continue;
-    }
-
-    if (invocation.attach) {
-      let binding: WorkspaceBinding;
-      try {
-        binding = await state.terminal.readyWorkspace(request.shellId);
-      } catch (error) {
-        const attachment = state.terminal.enter(active.ctx, { refresh: false });
-        const result = quickError(error);
-        process.stderr.write(result.output);
-        state.terminal.completeQuickAsk(result.exitCode, result.output);
-        exit = await attachment;
-        continue;
-      }
-      if (binding.piCwd === active.ctx.cwd) {
-        setBinding(state, binding);
-      } else {
-        const handoff = await handoffWorkspace(active.ctx, state, binding, {
-          withSession: async (replacementCtx) => {
-            await terminalLoop(
-              state,
-              {
-                ctx: replacementCtx,
-                sendUserMessage: (message) => replacementCtx.sendUserMessage(message),
-              },
-              request,
-            );
-          },
-        });
-        if (!handoff.cancelled) return;
-        const attachment = state.terminal.enter(active.ctx, { refresh: false });
-        const result = quickError(new Error("Termia cwd handoff was cancelled"));
-        process.stderr.write(result.output);
-        state.terminal.completeQuickAsk(result.exitCode, result.output);
-        exit = await attachment;
-        continue;
-      }
-    }
-
-    exit = await answerQuickAsk(state, active, request, invocation, messages);
-  }
-
+  const exit = await state.terminal.enter(ctx);
   const binding = await state.terminal.readyWorkspace(exit.shellId);
-  if (binding.piCwd === active.ctx.cwd) {
+  if (binding.piCwd === ctx.cwd) {
     setBinding(state, binding);
-    showWorkspace(active.ctx, state);
+    showWorkspace(ctx, state);
     return;
   }
-  const result = await handoffWorkspace(active.ctx, state, binding);
-  if (result.cancelled) active.ctx.ui.notify("Termia cwd change was cancelled", "warning");
+  const result = await handoffWorkspace(ctx, state, binding);
+  if (result.cancelled) ctx.ui.notify("Termia cwd change was cancelled", "warning");
 }
 
 async function restoreTerminalCwd(
@@ -507,11 +281,10 @@ async function runInvocation(
   ctx: ExtensionCommandContext,
   state: TermiaRuntime,
   invocation: TermiaInvocation,
-  sendUserMessage: UserMessageSender,
 ): Promise<void> {
   await ctx.waitForIdle();
   if (invocation.type === "terminal") {
-    await enterTerminal(ctx, state, sendUserMessage);
+    await enterTerminal(ctx, state);
   } else {
     await executeBang(pi, ctx, state, invocation);
   }
@@ -632,29 +405,8 @@ export default function termia(pi: ExtensionAPI): void {
     state.agentActive = true;
   });
 
-  pi.on("message_end", (event) => {
-    const turn = state.attachedTurn;
-    if (turn === undefined || event.message.role !== "assistant") return;
-    if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
-      turn.output = `${event.message.errorMessage ?? `Request ${event.message.stopReason}`}\n`;
-      turn.exitCode = event.message.stopReason === "aborted" ? 130 : 1;
-      return;
-    }
-    turn.output = event.message.content
-      .filter((content) => content.type === "text")
-      .map((content) => `${content.text}\n`)
-      .join("");
-    turn.exitCode = 0;
-  });
-
   pi.on("agent_settled", () => {
     state.agentActive = false;
-    const turn = state.attachedTurn;
-    if (turn === undefined) return;
-    finishAttachedTurn(state, {
-      exitCode: turn.aborted ? 130 : turn.exitCode,
-      output: turn.output,
-    });
   });
 
   pi.registerMessageRenderer<BangResultData>(
@@ -704,7 +456,6 @@ export default function termia(pi: ExtensionAPI): void {
     showWorkspace(ctx, state);
     if (
       state.terminal.running
-      && !state.quickAskActive
       && state.binding.target.scheme === "file"
       && state.terminal.cwd !== ctx.cwd
     ) {
@@ -753,7 +504,7 @@ export default function termia(pi: ExtensionAPI): void {
         if (!isManagedSession(sourceFile, ROOT)) {
           if (invocation.type === "bang") {
             try {
-              await runInvocation(pi, ctx, state, invocation, (message) => pi.sendUserMessage(message));
+              await runInvocation(pi, ctx, state, invocation);
             } catch (error) {
               ctx.ui.notify(errorMessage(error), "error");
             }
@@ -768,7 +519,6 @@ export default function termia(pi: ExtensionAPI): void {
                     replacementCtx,
                     state,
                     invocation,
-                    (message) => replacementCtx.sendUserMessage(message),
                   );
                 } catch (error) {
                   replacementCtx.ui.notify(errorMessage(error), "error");
@@ -785,7 +535,7 @@ export default function termia(pi: ExtensionAPI): void {
         }
 
         try {
-          await runInvocation(pi, ctx, state, invocation, (message) => pi.sendUserMessage(message));
+          await runInvocation(pi, ctx, state, invocation);
         } catch (error) {
           ctx.ui.notify(errorMessage(error), "error");
         }

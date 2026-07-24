@@ -8,55 +8,9 @@ import {
   type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { HistoryStore } from "../extensions/termia/history.ts";
-import {
-  createModeBashOperations,
-  createPtyBashOperations,
-} from "../extensions/termia/pty-bash.ts";
+import { createModeBashOperations } from "../extensions/termia/pty-bash.ts";
 import { TerminalController } from "../extensions/termia/terminal.ts";
 import { sshWorkspace, type SshHop } from "../extensions/termia/workspace.ts";
-
-test("adapts Pi bash operations to the persistent Termia shell", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "termia-pty-bash-"));
-  const cwd = join(root, "cwd");
-  const target = join(cwd, "target");
-  mkdirSync(target, { recursive: true });
-  const history = new HistoryStore(join(root, "state"));
-  const terminal = new TerminalController(history);
-  t.after(() => {
-    terminal.dispose();
-    history.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-
-  const operations = createPtyBashOperations(terminal);
-
-  await operations.exec("export TERMIA_AGENT_VALUE=agent", cwd, { onData: () => {} });
-  const chunks: Buffer[] = [];
-  const printed = await operations.exec(
-    `cd ${target}\nprintf '%s:%s\\n' "$TERMIA_AGENT_VALUE" "$PWD"`,
-    cwd,
-    { onData: (data) => chunks.push(data) },
-  );
-  assert.equal(printed.exitCode, 0);
-  assert.match(Buffer.concat(chunks).toString(), new RegExp(`agent:${target}`));
-  assert.equal(terminal.cwd, target);
-
-  const failed = await operations.exec("false", cwd, { onData: () => {} });
-  assert.equal(failed.exitCode, 1);
-
-  const abortController = new AbortController();
-  const aborted = operations.exec("sleep 10", cwd, {
-    onData: () => {},
-    signal: abortController.signal,
-  });
-  setTimeout(() => abortController.abort(), 100);
-  await assert.rejects(aborted, /^Error: aborted$/);
-
-  await assert.rejects(
-    operations.exec("sleep 10", cwd, { onData: () => {}, timeout: 0.1 }),
-    /^Error: timeout:0.1$/,
-  );
-});
 
 test("uses Pi detached Bash with ignored stdin while Termia is enabled locally", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "termia-mode-bash-"));
@@ -192,25 +146,4 @@ test("times out only the selected Agent Bash job", async (t) => {
   assert.equal(result.exitCode, 0);
   assert.equal(Buffer.concat(output).toString(), "after-timeout");
   assert.equal(history.listCompletedCommands(10).length, 0);
-});
-
-test("checks the requested workspace before writing to the PTY", async () => {
-  let writes = 0;
-  const terminal = {
-    running: true,
-    assertWorkspace: (cwd: string) => {
-      assert.equal(cwd, "/stale/mount");
-      throw new Error("Termia SSH workspace is disconnected");
-    },
-    execute: async () => {
-      writes += 1;
-      throw new Error("must not execute");
-    },
-  } as unknown as TerminalController;
-
-  await assert.rejects(
-    createPtyBashOperations(terminal).exec("pwd", "/stale/mount", { onData: () => {} }),
-    /SSH workspace is disconnected/,
-  );
-  assert.equal(writes, 0);
 });

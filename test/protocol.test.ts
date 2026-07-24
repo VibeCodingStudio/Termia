@@ -14,30 +14,10 @@ test("parses output and a command start in order", () => {
   ]);
 });
 
-test("round-trips a quick ask with exact shell arguments", () => {
+test("keeps removed quick-ask frames as terminal output", () => {
   const parser = new ProtocolParser();
-  const argv = ["spaces here", "quotes: '\"", "你好", ""];
-  const encodedArgv = Buffer.from(`${argv.join("\u0000")}\u0000`).toString("base64");
-  assert.deepEqual(parser.push(frame(`Q;${b64("local")};${b64("/tmp/工作")};${argv.length};${encodedArgv}`)), [
-    { type: "quickAsk", shellId: "local", cwd: "/tmp/工作", argv },
-  ]);
-  assert.deepEqual(parser.push(frame(`Q;${b64("local")};${b64("/tmp")};0;`)), [
-    { type: "quickAsk", shellId: "local", cwd: "/tmp", argv: [] },
-  ]);
-});
-
-test("keeps malformed quick asks as terminal output", () => {
-  const parser = new ProtocolParser();
-  const malformed = [
-    frame(`Q;${b64("local")};${b64("/tmp")};2;${b64("one\u0000")}`),
-    frame(`Q;${b64("local")};${b64("/tmp")};nope;${b64("one\u0000")}`),
-    frame(`Q;${b64("local")};${b64("/tmp")};1;%%%bad%%%`),
-    frame(`Q;${b64("local")};${b64("/tmp")};1;${b64("one\u0000")};extra`),
-    frame(`Q;;${b64("/tmp")};1;${b64("one\u0000")}`),
-  ];
-  for (const value of malformed) {
-    assert.deepEqual(parser.push(value), [{ type: "output", data: value }]);
-  }
+  const value = frame(`Q;${b64("local")};${b64("/tmp")};1;${b64("why\u0000")}`);
+  assert.deepEqual(parser.push(value), [{ type: "output", data: value }]);
 });
 
 test("buffers a split frame", () => {
@@ -92,20 +72,17 @@ test("flushes an unterminated frame as output", () => {
   assert.deepEqual(parser.flush(), []);
 });
 
-test("parses namespaced ready, command, and quick-ask frames", () => {
+test("parses namespaced ready and command frames", () => {
   const parser = new ProtocolParser();
-  const argv = Buffer.from("why\u0000--attach\u0000").toString("base64");
   const input = [
     frame(`R;${b64("shell-b")};${b64("/srv/app")}`),
     frame(`S;${b64("shell-b")};7;${b64("/srv/app")};${b64("pwd")}`),
     frame(`E;${b64("shell-b")};7;0;${b64("/srv/app")}`),
-    frame(`Q;${b64("shell-b")};${b64("/srv/app")};2;${argv}`),
   ].join("");
   assert.deepEqual(parser.push(input), [
     { type: "ready", shellId: "shell-b", cwd: "/srv/app" },
     { type: "start", shellId: "shell-b", sequence: 7, cwd: "/srv/app", command: "pwd" },
     { type: "end", shellId: "shell-b", sequence: 7, cwd: "/srv/app", exitCode: 0 },
-    { type: "quickAsk", shellId: "shell-b", cwd: "/srv/app", argv: ["why", "--attach"] },
   ]);
 });
 

@@ -27,8 +27,6 @@ export type CommandObservedEvent = {
   command: string;
   exitCode: number;
 };
-export type QuickAskRequest = { shellId: string; cwd: string; argv: string[] };
-export type QuickAskEvent = QuickAskRequest & { type: "quickAsk" };
 export type SshOpenEvent = {
   type: "sshOpen";
   parentShellId: string;
@@ -47,7 +45,6 @@ export type ProtocolToken =
   | CommandStartEvent
   | CommandEndEvent
   | CommandObservedEvent
-  | QuickAskEvent
   | SshOpenEvent
   | SshCloseEvent;
 
@@ -59,16 +56,6 @@ function decode(value: string): string | undefined {
     return undefined;
   }
   return Buffer.from(value, "base64").toString("utf8");
-}
-
-function decodeArguments(value: string, count: number): string[] | undefined {
-  if (!Number.isSafeInteger(count) || count < 0 || count > 4096) return undefined;
-  const decoded = decode(value);
-  if (decoded === undefined) return undefined;
-  if (count === 0) return decoded.length === 0 ? [] : undefined;
-  if (!decoded.endsWith("\u0000")) return undefined;
-  const argv = decoded.slice(0, -1).split("\u0000");
-  return argv.length === count ? argv : undefined;
 }
 
 function decodedText(value: string | undefined): string | undefined {
@@ -140,13 +127,6 @@ function parsePayload(payload: string): Exclude<ProtocolToken, OutputToken> | un
       || command === undefined
     ) return undefined;
     return { type: "observed", shellId, historyId, cwd, command, exitCode };
-  }
-  if (kind === "Q" && fields.length === 5) {
-    const shellId = decodedText(fields[1]);
-    const cwd = decodedAbsolutePath(fields[2]);
-    const argv = decodeArguments(fields[4] ?? "", Number(fields[3]));
-    if (shellId === undefined || cwd === undefined || argv === undefined) return undefined;
-    return { type: "quickAsk", shellId, cwd, argv };
   }
   if (kind === "H" && fields.length === 9) {
     const parentShellId = decodedText(fields[1]);

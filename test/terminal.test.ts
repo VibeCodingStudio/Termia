@@ -78,7 +78,7 @@ test("chunks long explicit execution input below the ash line limit", async () =
   const controller = new TerminalController(store);
   const writes = installFakePty(controller, true);
   const command = `printf '%s' '${"x".repeat(600)}'`;
-  const pending = controller.execute(command, { isolated: true });
+  const pending = controller.execute(command);
   const settled = pending.catch(() => undefined);
 
   try {
@@ -91,7 +91,7 @@ test("chunks long explicit execution input below the ash line limit", async () =
       assert.ok(match);
       return match[1];
     }).join("");
-    assert.equal(Buffer.from(encoded, "base64").toString("utf8"), `(${command})`);
+    assert.equal(Buffer.from(encoded, "base64").toString("utf8"), command);
   } finally {
     controller.dispose();
     await settled;
@@ -363,9 +363,9 @@ test("allows only one terminal attachment", async (t) => {
     },
   } as unknown as Parameters<TerminalController["enter"]>[0];
   const baselineListeners = process.stdin.listenerCount("data");
-  const first = controller.enter(ctx, { refresh: false });
+  const first = controller.enter(ctx);
   await new Promise<void>((resolve) => setImmediate(resolve));
-  const second = controller.enter(ctx, { refresh: false });
+  const second = controller.enter(ctx);
 
   try {
     const outcome = await Promise.race([

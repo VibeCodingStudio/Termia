@@ -1,7 +1,7 @@
 import { stripVTControlCharacters } from "node:util";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
-import type { CommandRecord } from "./history.ts";
+import type { CommandRecord, HistoryStore } from "./history.ts";
 
 type HistoryAction = "up" | "down" | "expand";
 type HistoryTheme = Pick<Theme, "fg" | "bg">;
@@ -176,4 +176,43 @@ export class HistoryOverlay implements Component {
   }
 
   invalidate(): void {}
+}
+
+export function registerHistoryCommand(
+  api: Pick<ExtensionAPI, "registerCommand">,
+  enabled: boolean,
+  history: HistoryStore,
+): void {
+  if (!enabled) return;
+  api.registerCommand("history", {
+    description: "Show persistent-shell command history",
+    handler: async (_args, ctx) => {
+      if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        ctx.ui.notify("Termia history requires Pi TUI mode", "error");
+        return;
+      }
+      if (history.listCommands(1).length === 0) {
+        ctx.ui.notify("Termia command history is empty", "info");
+        return;
+      }
+      const selected = await ctx.ui.custom<CommandRecord[] | undefined>(
+        (_tui, theme, keybindings, done) =>
+          new HistoryOverlay(
+            new HistoryOverlayModel(
+              history.listCommands(200),
+              (command) => history.readOutput(command),
+            ),
+            theme,
+            (data) => keybindings.matches(data, "app.tools.expand"),
+            keybindings.getKeys("app.tools.expand").join("/"),
+            done,
+          ),
+        {
+          overlay: true,
+          overlayOptions: { width: "80%", minWidth: 48, maxHeight: "80%" },
+        },
+      );
+      if (selected !== undefined) ctx.ui.pasteToEditor(formatHistoryPaste(selected));
+    },
+  });
 }

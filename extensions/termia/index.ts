@@ -24,11 +24,7 @@ import {
   type BangResultData,
 } from "./bang-result.ts";
 import { HistoryStore, type CommandRecord } from "./history.ts";
-import {
-  formatHistoryPaste,
-  HistoryOverlay,
-  HistoryOverlayModel,
-} from "./history-overlay.ts";
+import { registerHistoryCommand } from "./history-overlay.ts";
 import { createHistoryTool } from "./history-tool.ts";
 import {
   termiaRoot,
@@ -545,6 +541,8 @@ async function toggleTermiaMode(
   }
 
   const enabling = !state.enabled;
+  const previousEnabled = state.enabled;
+  state.enabled = enabling;
   let notifySwitched: (() => void) | undefined;
   try {
     const result = enabling
@@ -576,6 +574,7 @@ async function toggleTermiaMode(
           });
 
     if (result.cancelled) {
+      state.enabled = previousEnabled;
       ctx.ui.notify("Termia mode change was cancelled", "warning");
       return;
     }
@@ -583,8 +582,10 @@ async function toggleTermiaMode(
       notifySwitched?.();
       return;
     }
+    state.enabled = previousEnabled;
     ctx.ui.notify("Termia mode has no session to return to", "error");
   } catch (error) {
+    state.enabled = previousEnabled;
     ctx.ui.notify(`Termia mode change failed: ${errorMessage(error)}`, "error");
   }
 }
@@ -667,6 +668,7 @@ export default function termia(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     if (isTermiaPty()) return;
     const state = runtime();
+    registerHistoryCommand(pi, state.enabled, state.history);
     state.editorFactory = installBangEditor(
       ctx.ui,
       state.editorFactory,
@@ -783,43 +785,6 @@ export default function termia(pi: ExtensionAPI): void {
       } finally {
         if (invocation.type === "terminal") restoreEditorDraft(ctx, state);
       }
-    },
-  });
-
-  pi.registerCommand("termia-history", {
-    description: "Show persistent-shell command history",
-    handler: async (_args, ctx) => {
-      const state = runtime();
-      if (!state.enabled) {
-        ctx.ui.notify(TERMIA_DISABLED_NOTICE, "info");
-        return;
-      }
-      if (!process.stdin.isTTY || !process.stdout.isTTY) {
-        ctx.ui.notify("Termia history requires Pi TUI mode", "error");
-        return;
-      }
-      if (state.history.listCommands(1).length === 0) {
-        ctx.ui.notify("Termia command history is empty", "info");
-        return;
-      }
-      const selected = await ctx.ui.custom<CommandRecord[] | undefined>(
-        (_tui, theme, keybindings, done) =>
-          new HistoryOverlay(
-            new HistoryOverlayModel(
-              state.history.listCommands(200),
-              (command) => state.history.readOutput(command),
-            ),
-            theme,
-            (data) => keybindings.matches(data, "app.tools.expand"),
-            keybindings.getKeys("app.tools.expand").join("/"),
-            done,
-          ),
-        {
-          overlay: true,
-          overlayOptions: { width: "80%", minWidth: 48, maxHeight: "80%" },
-        },
-      );
-      if (selected !== undefined) ctx.ui.pasteToEditor(formatHistoryPaste(selected));
     },
   });
 

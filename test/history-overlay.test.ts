@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { CommandRecord } from "../extensions/termia/history.ts";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type { CommandRecord, HistoryStore } from "../extensions/termia/history.ts";
 import {
   formatHistoryContext,
   formatHistoryPaste,
   HistoryOverlay,
   HistoryOverlayModel,
+  registerHistoryCommand,
 } from "../extensions/termia/history-overlay.ts";
 
 const commands: CommandRecord[] = [
@@ -48,6 +49,19 @@ const theme: Pick<Theme, "fg" | "bg"> = {
   fg: (_color, text) => text,
   bg: (_color, text) => text,
 };
+
+test("registers /history only for an enabled Termia session", () => {
+  const registered: string[] = [];
+  const api = {
+    registerCommand: (name: string) => registered.push(name),
+  } as unknown as Pick<ExtensionAPI, "registerCommand">;
+  const store = {} as HistoryStore;
+
+  registerHistoryCommand(api, false, store);
+  assert.deepEqual(registered, []);
+  registerHistoryCommand(api, true, store);
+  assert.deepEqual(registered, ["history"]);
+});
 
 test("selects commands in display order and formats metadata without output", () => {
   const outputs = new Map([["old", "\u001b[31mplain text\u001b[0m\r\n"]]);

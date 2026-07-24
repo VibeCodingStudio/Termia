@@ -20,9 +20,12 @@
     "url": "https://github.com/VibeCodingStudio/Termia/issues"
   },
   "type": "module",
-  "files": ["extensions", "README.md", "LICENSE"],
+  "files": ["extensions", "assets", "README.md", "LICENSE"],
   "engines": { "node": ">=22.19.0" },
-  "pi": { "extensions": ["./extensions/termia/index.ts"] },
+  "pi": {
+    "extensions": ["./extensions/termia/index.ts"],
+    "image": "https://raw.githubusercontent.com/VibeCodingStudio/Termia/main/assets/termia-preview.png"
+  },
   "scripts": {
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit"

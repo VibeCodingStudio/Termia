@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { constants } from "node:fs";
 import {
   access,
   chmod,
@@ -9,7 +10,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import type { SshOpenEvent } from "./protocol.ts";
 import {
   fileWorkspace,
@@ -159,6 +160,16 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+async function requireLocalCommand(command: string): Promise<void> {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    try {
+      await access(join(directory || ".", command), constants.X_OK);
+      return;
+    } catch {}
+  }
+  throw new Error(`${command} is required on the machine running Pi`);
+}
+
 async function isMountPoint(path: string): Promise<boolean> {
   try {
     const [entry, parent] = await Promise.all([stat(path), stat(dirname(path))]);
@@ -203,6 +214,8 @@ export class WorkspaceMount implements MountOperations {
     const leaf = hops.at(-1);
     if (leaf === undefined) throw new Error("Cannot mount an empty SSH hop chain");
     if (this.mounts.has(leaf.shellId)) throw new Error(`SSH shell is already mounted: ${leaf.shellId}`);
+    await requireLocalCommand("sshfs");
+    if (process.platform !== "darwin") await requireLocalCommand("fusermount3");
 
     const runtimeRoot = await this.ensureRuntimeRoot();
     const mountRoot = workspaceMountPath(hops);

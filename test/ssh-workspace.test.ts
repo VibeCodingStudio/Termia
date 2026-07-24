@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   buildSftpBridgeScript,
   prepareWorkspaceMountPath,
   SshChain,
+  WorkspaceMount,
   workspaceMountName,
   workspaceMountPath,
   type MountOperations,
@@ -121,6 +122,43 @@ test("names mount directories by hop depth and leaf identity", () => {
 
 test("mounts the remote root directly at the named workspace directory", () => {
   assert.equal(workspaceMountPath(hops), "/tmp/termia-ssh/2-bob@10.0.0.20-p2222");
+});
+
+test("reports a missing local sshfs dependency before mounting", async (t) => {
+  const path = await mkdtemp(join(tmpdir(), "termia-empty-path-"));
+  const previousPath = process.env.PATH;
+  process.env.PATH = path;
+  t.after(async () => {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(path, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    new WorkspaceMount().mount([hops[0]!], "/home/alice"),
+    /sshfs is required on the machine running Pi/,
+  );
+});
+
+test("reports a missing local fusermount3 dependency before mounting on Linux", {
+  skip: process.platform === "darwin",
+}, async (t) => {
+  const path = await mkdtemp(join(tmpdir(), "termia-sshfs-only-path-"));
+  const sshfs = join(path, "sshfs");
+  await writeFile(sshfs, "#!/bin/sh\nexit 0\n");
+  await chmod(sshfs, 0o700);
+  const previousPath = process.env.PATH;
+  process.env.PATH = path;
+  t.after(async () => {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(path, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    new WorkspaceMount().mount([hops[0]!], "/home/alice"),
+    /fusermount3 is required on the machine running Pi/,
+  );
 });
 
 test("replaces a stale stable workspace directory", async (t) => {

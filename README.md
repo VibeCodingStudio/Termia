@@ -1,29 +1,26 @@
 # Termia
 
-Termia is a Pi-native persistent terminal with command history and managed
-nested SSH workspaces. It is installed as a Pi package and remains disabled
-until you run `/termia`, so Pi keeps its normal coding-agent behavior by
-default.
+Termia gives [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
+a persistent interactive shell, recorded command history, and managed nested
+SSH workspaces. It stays disabled until you run `/termia`, so Pi keeps its
+normal coding-agent behavior by default.
+
+![Termia command history in a managed SSH workspace](https://raw.githubusercontent.com/VibeCodingStudio/Termia/main/assets/termia-preview.png)
 
 ## Install
 
-Install [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
-first:
+Install Pi, then install Termia from npm:
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent
-```
-
-Then install Termia from npm:
-
-```bash
 pi install npm:@vibecodingstudio/termia
 ```
 
-Node.js 22.19 or newer is required. Managed SSH workspaces also require
-`sshfs` and `fusermount3`; macOS uses `umount`.
+Termia requires Node.js 22.19 or newer. Managed SSH workspaces also require
+SSHFS. On Linux, install `sshfs` and `fusermount3`; on macOS, install a
+compatible SSHFS implementation.
 
-### From source
+To install from source:
 
 ```bash
 npm install
@@ -32,141 +29,100 @@ pi install ./
 
 ## Quick start
 
-Start `pi` in a persisted session and run `/termia`. While the Agent is idle,
-press `Ctrl+]` to switch between Pi and the persistent terminal.
+Start `pi` in a persisted session and run `/termia`:
 
 ```text
-/termia           enable or disable Termia for this Pi process
-Ctrl+]            switch between Agent and the persistent shell while the Agent is idle
-!command          run in the persistent shell and include the result in Agent context
-!!command         run in the persistent shell without adding the result to Agent context
-/history          open recorded command history while Termia is enabled
+/termia           enable or disable Termia
+Ctrl+]            switch between Agent and terminal while the Agent is idle
+!command          run in the persistent shell and add the result to Agent context
+!!command         run in the persistent shell without adding it to Agent context
+/history          open recorded command history
 ```
 
-Enabling `/termia` remembers the current Pi session and opens a fresh,
-empty session under Termia-managed storage. Native `/new`, `/resume`, and
-`/fork` then stay in that storage. Running `/termia` again disables the
-mode and returns to the exact session that was active before enabling it.
-Termia mode is never persisted and starts disabled in every new Pi process.
-Inside its managed session, `/history` appears in command completion. On first
-entry, Pi shows a reminder for `/history` and that `Ctrl+]` switches between
-Agent and the persistent shell while the Agent is idle. Later entries still
-remind you about `/history`. Any unfinished Agent prompt is preserved across
-an idle switch. While the Agent is running, `Ctrl+]` is consumed silently and
-is never queued for a delayed switch.
+Termia mode starts disabled in every Pi process. Enabling it opens a fresh,
+empty Termia session and remembers the session you came from. Running
+`/termia` again disables the mode and returns to that original session.
 
-Enabling Termia also activates fixed operational guidance for evidence-first
-troubleshooting, local and SSH workspace boundaries, nested SSH identity, and
-high-risk operations. Pi rebuilds its base prompt when the mode-gated history
-tool is activated or removed; Termia does not append that guidance on every
-Agent turn. For SSH workspaces, the per-turn hook only replaces Pi's physical
-working directory with the current logical `ssh://` URI so `cd` and nested SSH
-handoffs remain accurate.
+The persistent terminal prompt begins with `[termia]`. Press `Ctrl+]` while the
+Agent is idle to move between Pi and the terminal without stopping the shell or
+discarding an unfinished prompt. While the Agent is running, the shortcut is
+ignored instead of being queued for a later switch.
 
-While disabled, Pi's `bash`, `!`, and `!!` retain their native behavior,
-`termia_history` is inactive, and `/history` is not registered. `/termia`
-remains available to enable the mode.
+## Persistent shell and Agent commands
 
-The persistent shell prompt starts with `[termia]`, so it remains visible after
-scrolling. A Pi process launched from that shell keeps its native `!` behavior;
-its `/termia` command refuses to create a nested Termia PTY. To ask the Agent
-from the persistent shell, press `Ctrl+]` to return to Pi and submit a normal
-message. The shell does not define a separate `termia` command.
+Commands typed in the terminal, or submitted with `!` and `!!`, share one
+persistent shell. Its cwd, exported and unexported variables, aliases,
+functions, and jobs survive between commands. `Escape` interrupts a running
+`!` or `!!` command.
 
-While Termia mode is enabled, ordinary Pi `bash` uses Pi's detached,
-non-interactive Bash backend. Local commands start in the active workspace cwd;
-SSH commands reuse the authenticated Termia `ControlMaster` chain with `ssh -T`
-and start in the active logical remote cwd. Multiple commands can run
-concurrently, but they do not inherit aliases, functions, unexported variables,
-jobs, or other process-local state from the interactive Termia shell. Their
-assignments and `cd` also do not change that shell.
+Agent Bash commands are different: they run as detached, concurrent,
+non-interactive jobs and stay outside Termia command history. They start in the
+active local or SSH workspace but do not inherit process-local shell state, and
+their `cd` or assignments do not modify the persistent shell.
 
-Ordinary Agent Bash receives no interactive stdin or controlling terminal.
-Commands that require a password, confirmation, or `/dev/tty` therefore fail
-normally instead of blocking; use the main `/termia` terminal for interactive
-work. When Termia mode is disabled, Bash continues to use Pi's local backend.
-Termia delegates the tool schema, output truncation, timeout, cancellation, and
-Agent loop to Pi.
+Because Agent Bash has no interactive input or controlling terminal, commands
+that require a password, confirmation, or `/dev/tty` fail normally instead of
+blocking. Use the persistent terminal for `sudo` passwords, interactive package
+upgrades, and other prompts.
 
-Agent `bash` output is streamed to Pi and stays completely outside Termia
-history. Normal interactive shell output remains unchanged.
+## Command history
 
-In `/history`, use Up/Down to move, Space to select multiple commands,
-Pi's configured tool-output expansion key (`Ctrl+O` by default) to preview the
-active command, and Enter to place the selected command metadata in the editor.
-The metadata includes the command, cwd, exit code, time, duration, and stable
-history index, but not its output.
+Termia records interactive commands with their cwd, exit code, time, duration,
+and workspace. Open `/history`, move with Up/Down, select entries with Space,
+preview the active entry with Pi's tool-output expansion key (`Ctrl+O` by
+default), and press Enter to add compact history references to the Pi editor.
+The Agent can then inspect the selected command output on demand without
+filling the prompt with the full transcript.
 
-When the Agent needs that output, it can call the extension-only
-`termia_history(index, offset?, limit?)` tool. Results are ANSI-free and bounded
-to 2,000 lines or 50KB; `offset` and `limit` select a 1-based line range. Tool
-details report `totalLines` and `hasMore` so the Agent can continue long output
-without guessing.
-
-Enabling Termia mode moves the active conversation into
-`<getAgentDir()>/termia/pi-sessions/`. `/termia`, `!command`, and `!!command`
-then use the same persistent PTY, so cwd, environment variables, aliases, and
-shell functions survive between commands. `Escape` interrupts a running `!` or
-`!!` command.
-
-Changing directory through terminal mode, `!`, or `!!` immediately moves that same conversation to the shell's real cwd before the Pi editor returns. Pi's footer, built-in tools, `@file`, project resources, trust checks, and third-party extensions therefore see the new directory.
+Manual commands, `!`, and `!!` are recorded. Agent Bash commands are not.
 
 ## Managed SSH workspaces
 
-From `/termia`, a plain interactive `ssh host` is managed as a workspace hop.
-`ssh -4/-6`, `-p`, `-l`, and `--` are supported; commands, tunnels, custom
-identity flags, and other SSH forms keep native SSH behavior. Managed hops can
-nest (`local -> A -> B -> C`): every new SSH process and credential lookup runs
-on its immediate parent host, so B and C keys do not need to exist locally.
+From the persistent terminal, a plain interactive `ssh host` becomes a managed
+workspace. `ssh -4`, `ssh -6`, `-p`, `-l`, and `--` are supported. SSH commands,
+tunnels, and other advanced forms keep their normal SSH behavior.
 
-While the Agent is idle, pressing `Ctrl+]` returns to Pi without closing the SSH processes. Pi keeps a
-physical SSHFS mount for its built-in read/edit/write/grep/find/ls tools,
-`@file`, project resources, and Agent bash transcripts, while the prompt and
-status expose only the logical URI such as `ssh://user@host/srv/app`. Absolute
-file paths map to the remote root; relative paths use the remote cwd. Use an absolute path
-instead of `~` in file tools. Agent bash is forked by that same remote shell and
-remains outside `/history`; manual commands, `!`, and `!!` retain their
-SSH workspace provenance.
+Managed hops can nest, for example `local -> A -> B -> C`. Each hop runs from
+its immediate parent, so credentials needed for B or C remain on the parent
+host. Pressing `Ctrl+]` returns to Pi without closing the SSH chain. Pi's file
+tools, `@file`, project resources, and Agent Bash then operate on the active
+remote workspace, while the interface shows a logical cwd such as:
 
-The local machine needs `sshfs` and `fusermount3` (macOS uses `umount`). If
-SFTP is unavailable, the interactive SSH shell still works but Termia refuses
-the Pi handoff instead of reading a same-named local file. A dropped mount
-blocks workspace tools without retrying; run `/termia` to return to the nearest
-live parent, then reconnect manually if desired. Password-authenticated hops
-can be entered normally, but Termia never persists passwords or reconnects
-them. Exiting hops returns through their retained parents to the directory Pi
-had open before Termia. Quitting Pi closes the masters without serializing or
-reconnecting the SSH chain.
-
-The gated integration fixture proves an isolated `local -> A -> B -> C` chain,
-SFTP failure, disconnect fallback, history provenance, and credential locality:
-
-```bash
-TERMIA_SSH_INTEGRATION=1 node --test test/ssh-integration.test.ts
+```text
+ssh://user@example.com/srv/app
 ```
 
+SSH file access requires both SSHFS on the local machine and SFTP on the remote
+host. If file access is unavailable, the interactive SSH shell can continue,
+but Termia will not expose that remote workspace to Pi. A dropped connection or
+mount is not reconnected automatically; return to a live parent and reconnect
+manually. Password-authenticated SSH works interactively, but Termia never
+stores or replays passwords.
+
+Exiting SSH returns through the retained parent hops and finally to the local
+directory that was active before the first hop. Quitting Pi closes the managed
+SSH connections.
+
 ## Storage
+
+Termia stores its data under Pi's agent directory:
 
 ```text
 ~/.pi/agent/termia/history.db        command metadata
 ~/.pi/agent/termia/transcripts/      raw terminal output
 ~/.pi/agent/termia/pi-sessions/      Termia Pi sessions
-~/.pi/agent/termia/retired/          superseded session forks
+~/.pi/agent/termia/retired/          superseded sessions
 ```
 
-These paths are derived from Pi's public `getAgentDir()` API. Setting
-`PI_CODING_AGENT_DIR` moves the complete `termia/` tree with Pi's agent
-configuration. Termia mode is process-local and starts disabled on every Pi
-launch. The old Go Termia database and former development storage are not read
-or migrated.
+Setting `PI_CODING_AGENT_DIR` moves the complete `termia/` tree with Pi's agent
+configuration.
 
 ## Limits
 
 - Linux, WSL2, and macOS
 - bash, zsh, BusyBox ash, and BusyBox sh interactive shells
 - Pi TUI mode with a persisted session
-- bounded bang results in the Pi session; full raw output remains available through `/history`
-- with Termia mode enabled, Agent `bash` uses concurrent isolated child jobs and stays outside Termia history
+- SSHFS and remote SFTP for managed SSH file access
 
 ## Uninstall
 
@@ -177,9 +133,10 @@ pi remove npm:@vibecodingstudio/termia
 ## Security
 
 Pi packages execute local code. Termia starts an interactive shell, records
-terminal history, and can expose managed SSH workspaces to Pi's tools. Install
-it only from a source you trust, verify the active host and directory before
-making changes, and review destructive commands before running them.
+terminal history, and can expose remote files to Pi through managed SSH
+workspaces. Install it only from a source you trust, verify the active host and
+directory before making changes, and review destructive commands before
+running them.
 
 ## License
 

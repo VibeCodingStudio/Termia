@@ -56,7 +56,7 @@ __termia_complete() {
   __termia_command=$(printf '%s' "$__termia_history" \
     | command sed 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*//')
   case "$__termia_command" in
-    ''|__termia_*|termia|termia\ *|ssh|ssh\ *|*termia.ash*) return ;;
+    ''|__termia_*|ssh|ssh\ *|*termia.ash*) return ;;
   esac
   __termia_shell_id=$(printf '%s' "$TERMIA_SHELL_ID" | __termia_b64)
   __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
@@ -112,55 +112,6 @@ __termia_exec_stream() {
     __termia_payload=$__termia_payload$__termia_chunk
   done
   __termia_exec "$__termia_payload"
-}
-
-termia() {
-  local __termia_argv __termia_reply __termia_cwd __termia_payload __termia_shell_id
-  local __termia_command __termia_termia_sequence __termia_status
-  __termia_guard=1
-  __termia_command=$(history 2>/dev/null | command sed -n '$s/^[[:space:]]*[0-9][0-9]*[[:space:]]*//p')
-  [ -n "$__termia_command" ] || __termia_command=termia
-  __termia_sequence=$((__termia_sequence + 1))
-  __termia_termia_sequence=$__termia_sequence
-  __termia_shell_id=$(printf '%s' "$TERMIA_SHELL_ID" | __termia_b64)
-  __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
-  __termia_command=$(printf '%s' "$__termia_command" | __termia_b64)
-  printf '\033]6973;S;%s;%s;%s;%s\007' \
-    "$__termia_shell_id" "$__termia_termia_sequence" "$__termia_cwd" "$__termia_command" > /dev/tty
-
-  if [ "$#" -eq 0 ]; then
-    __termia_argv=
-  else
-    __termia_argv=$(printf '%s\0' "$@" | __termia_b64)
-  fi
-  printf '\033]6973;Q;%s;%s;%s;%s\007' \
-    "$__termia_shell_id" "$__termia_cwd" "$#" "$__termia_argv" > /dev/tty
-  while IFS= read -r -s __termia_reply; do
-    case "$__termia_reply" in
-      D\;*)
-        __termia_status=${__termia_reply#D;}
-        case "$__termia_status" in
-          ''|*[!0-9]*) continue ;;
-        esac
-        [ "$__termia_status" -le 255 ] || continue
-        __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
-        printf '\033]6973;E;%s;%s;%s;%s\007' \
-          "$__termia_shell_id" "$__termia_termia_sequence" "$__termia_status" "$__termia_cwd" > /dev/tty
-        __termia_guard=0
-        return "$__termia_status"
-        ;;
-      X\;*)
-        __termia_payload=${__termia_reply#X;}
-        __termia_exec "$__termia_payload"
-        ;;
-    esac
-  done
-
-  __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
-  printf '\033]6973;E;%s;%s;1;%s\007' \
-    "$__termia_shell_id" "$__termia_termia_sequence" "$__termia_cwd" > /dev/tty
-  __termia_guard=0
-  return 1
 }
 
 __termia_history=$(history 2>/dev/null | command sed -n '$p')

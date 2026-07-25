@@ -72,6 +72,33 @@ test("detects only the Termia PTY marker", () => {
   assert.equal(isTermiaPty(undefined), false);
 });
 
+test("uses and removes a private runtime hook directory", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-runtime-"));
+  const cwd = join(root, "cwd");
+  mkdirSync(cwd);
+  const store = new HistoryStore(join(root, "state"));
+  const controller = new TerminalController(store);
+  t.after(() => {
+    controller.dispose();
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  controller.start(cwd, "/bin/bash");
+  await controller.execute("true");
+  const runtime = Reflect.get(controller, "identityRuntime") as
+    | { hookDirectory: string; privateKey?: string }
+    | undefined;
+  assert.ok(runtime);
+  assert.match(runtime.hookDirectory, /^\/tmp\/termia-hooks-/);
+  assert.equal(existsSync(join(runtime.hookDirectory, "termia.bash")), true);
+  assert.equal(existsSync(runtime.privateKey ?? ""), true);
+
+  const hookDirectory = runtime.hookDirectory;
+  controller.dispose();
+  assert.equal(existsSync(hookDirectory), false);
+});
+
 test("chunks long explicit execution input below the ash line limit", async () => {
   const root = mkdtempSync(join(tmpdir(), "termia-terminal-chunks-"));
   const store = new HistoryStore(join(root, "state"));

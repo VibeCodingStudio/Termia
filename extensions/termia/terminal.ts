@@ -6,6 +6,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type IDisposable, type IPty } from "node-pty";
 import type { CommandRecord } from "./history.ts";
 import { HistoryStore } from "./history.ts";
+import { createIdentityRuntime, type IdentityRuntime } from "./identity-runtime.ts";
 import { ProtocolParser, type ProtocolToken } from "./protocol.ts";
 import { SshChain, type MountOperations } from "./ssh-workspace.ts";
 import { fileWorkspace, type WorkspaceBinding } from "./workspace.ts";
@@ -57,6 +58,7 @@ export class TerminalController {
   private readonly listeners = new Set<CommandListener>();
   private readonly history: HistoryStore;
   private readonly sshChain: SshChain;
+  private identityRuntime: IdentityRuntime | undefined;
   private subscriptions: IDisposable[] = [];
   private pty: IPty | undefined;
   private execution: ActiveExecution | undefined;
@@ -108,6 +110,8 @@ export class TerminalController {
     if (this.pty !== undefined) return;
     if (!statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
     const hook = shellHook(shell);
+    const identityRuntime = createIdentityRuntime(SHELL_DIRECTORY);
+    this.identityRuntime = identityRuntime;
 
     const terminalId = randomUUID();
     this.sshChain.resetRoot(fileWorkspace(cwd), terminalId);
@@ -123,10 +127,12 @@ export class TerminalController {
           ...process.env,
           TERMIA_PTY: "1",
           TERMIA_SHELL_ID: terminalId,
-          TERMIA_HOOK_DIR: SHELL_DIRECTORY,
+          TERMIA_HOOK_DIR: identityRuntime.hookDirectory,
         },
       });
     } catch (error) {
+      identityRuntime.dispose();
+      this.identityRuntime = undefined;
       this.history.endTerminal();
       throw error;
     }
@@ -144,7 +150,7 @@ export class TerminalController {
       child.onData((data: string) => this.consume(data)),
       child.onExit(() => this.finish(child)),
     ];
-    child.write(` . ${shellQuote(resolve(SHELL_DIRECTORY, `termia.${hook}`))}\r`);
+    child.write(` . ${shellQuote(resolve(identityRuntime.hookDirectory, `termia.${hook}`))}\r`);
   }
 
   write(data: string | Buffer): void {
@@ -288,6 +294,8 @@ export class TerminalController {
       child.kill();
       this.finish(child);
     }
+    this.identityRuntime?.dispose();
+    this.identityRuntime = undefined;
     void this.sshChain.dispose();
   }
 
@@ -436,6 +444,8 @@ export class TerminalController {
     this.observedHistoryIds.clear();
     this.manualCommandStartedAt.clear();
     this.history.endTerminal();
+    this.identityRuntime?.dispose();
+    this.identityRuntime = undefined;
     void this.sshChain.dispose();
     const execution = this.execution;
     if (execution !== undefined) {

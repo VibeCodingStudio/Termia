@@ -85,6 +85,30 @@ test("records command metadata against transcript byte offsets", (t) => {
   store.close(40);
 });
 
+test("reads bounded active transcript tails without changing history", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-history-tail-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const store = new HistoryStore(root);
+  store.startTerminal({ id: "tail", shell: "/bin/bash", cwd: "/tmp" });
+  store.appendOutput("discard-me\nkeep-me\nlast");
+  const completeOffset = store.outputOffset;
+
+  assert.equal(store.readActiveOutputTail(1_024), "discard-me\nkeep-me\nlast");
+  assert.equal(
+    store.readActiveOutputTail(Buffer.byteLength("p-me\nlast")),
+    "last",
+  );
+  assert.equal(store.outputOffset, completeOffset);
+  assert.throws(() => store.readActiveOutputTail(0), /positive safe integer/);
+
+  store.appendOutput("你你你");
+  const unicodeOffset = store.outputOffset;
+  assert.equal(store.readActiveOutputTail(5), "你");
+  assert.equal(store.outputOffset, unicodeOffset);
+  store.close();
+});
+
 test("records a completed ash command from the previous prompt boundary", (t) => {
   const root = mkdtempSync(join(tmpdir(), "termia-history-observed-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));

@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  writeFileSync,
+} from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
@@ -150,6 +158,49 @@ export class HistoryStore {
 
   get outputOffset(): number {
     return this.requireTerminal().offset;
+  }
+
+  readActiveOutputTail(maxBytes: number): string {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+      throw new Error("Transcript tail limit must be a positive safe integer");
+    }
+
+    const terminal = this.requireTerminal();
+    const length = Math.min(maxBytes, terminal.offset);
+    if (length === 0) return "";
+
+    const start = terminal.offset - length;
+    const data = Buffer.allocUnsafe(length);
+    const descriptor = openSync(terminal.transcriptPath, "r");
+    try {
+      let bytesRead = 0;
+      while (bytesRead < length) {
+        const count = readSync(
+          descriptor,
+          data,
+          bytesRead,
+          length - bytesRead,
+          start + bytesRead,
+        );
+        if (count === 0) break;
+        bytesRead += count;
+      }
+
+      const tail = data.subarray(0, bytesRead);
+      if (start === 0) return tail.toString("utf8");
+
+      const newline = tail.indexOf(0x0a);
+      if (newline >= 0) return tail.subarray(newline + 1).toString("utf8");
+
+      let alignedStart = 0;
+      while (
+        alignedStart < tail.length
+        && (tail[alignedStart]! & 0xc0) === 0x80
+      ) alignedStart += 1;
+      return tail.subarray(alignedStart).toString("utf8");
+    } finally {
+      closeSync(descriptor);
+    }
   }
 
   startCommand(

@@ -14,8 +14,8 @@ import { join } from "node:path";
 import test from "node:test";
 import type { IPty } from "node-pty";
 import { HistoryStore, type CommandRecord } from "../extensions/termia/history.ts";
-import type { SshOpenEvent } from "../extensions/termia/protocol.ts";
-import type { MountOperations } from "../extensions/termia/ssh-workspace.ts";
+import type { IdentityOpenEvent, SshOpenEvent } from "../extensions/termia/protocol.ts";
+import type { IdentityOperations, MountOperations } from "../extensions/termia/ssh-workspace.ts";
 import { isTermiaPty, TerminalController } from "../extensions/termia/terminal.ts";
 import { sshWorkspace, workspaceUri, type SshHop, type WorkspaceBinding } from "../extensions/termia/workspace.ts";
 
@@ -446,6 +446,36 @@ class TerminalMounts implements MountOperations {
   }
 }
 
+class TerminalIdentities implements IdentityOperations {
+  privateKey: string | undefined;
+  readonly closed: string[] = [];
+
+  async open(
+    event: IdentityOpenEvent,
+    parentHops: readonly SshHop[],
+    privateKey: string,
+  ): Promise<SshHop> {
+    this.privateKey = privateKey;
+    const parent = parentHops.at(-1)!;
+    return {
+      shellId: event.shellId,
+      parentShellId: event.parentShellId,
+      destination: `${event.user}@termia-identity-${event.shellId}`,
+      user: event.user,
+      host: parent.host,
+      port: parent.port,
+      controlPath: `/tmp/identity-${event.shellId}/control`,
+      localAnchor: true,
+    };
+  }
+
+  async close(shellId: string): Promise<void> {
+    this.closed.push(shellId);
+  }
+
+  async dispose(): Promise<void> {}
+}
+
 test("routes SSH protocol events into workspace bindings", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "termia-terminal-workspace-"));
   const cwd = join(root, "cwd");
@@ -514,4 +544,54 @@ test("routes SSH protocol events into workspace bindings", async (t) => {
   consume.call(controller, { type: "sshClose", shellId: "shell-a" });
   await new Promise<void>((resolveTick) => setImmediate(resolveTick));
   assert.equal(controller.workspace.piCwd, cwd);
+});
+
+test("routes identity events to the switched-user workspace", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-identity-"));
+  const cwd = join(root, "cwd");
+  mkdirSync(cwd);
+  const store = new HistoryStore(join(root, "state"));
+  const identities = new TerminalIdentities();
+  const controller = new TerminalController(store, new TerminalMounts(), identities);
+  t.after(() => {
+    controller.dispose();
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  controller.start(cwd, "/bin/bash");
+  await controller.execute("true");
+
+  const parentShellId = Reflect.get(controller, "activeShellId") as string;
+  const consume = Reflect.get(controller, "consumeToken") as (token: unknown) => void;
+  consume.call(controller, {
+    type: "sshOpen",
+    parentShellId,
+    shellId: "shell-a",
+    destination: "host-a",
+    user: "alice",
+    host: "10.0.0.10",
+    port: 22,
+    controlPath: "/tmp/termia-a/control",
+    cwd: "/home/alice",
+  } satisfies SshOpenEvent);
+  await controller.readyWorkspace("shell-a");
+  consume.call(controller, {
+    type: "identityOpen",
+    parentShellId: "shell-a",
+    shellId: "shell-root",
+    user: "root",
+    cwd: "/root",
+    port: 45123,
+    hostKey: "ssh-ed25519 AAAA",
+  } satisfies IdentityOpenEvent);
+
+  const binding = await controller.readyWorkspace("shell-root");
+  assert.equal(workspaceUri(binding.target), "ssh://root@10.0.0.10/root");
+  assert.match(identities.privateKey ?? "", /^\/tmp\/termia-hooks-/);
+  consume.call(controller, { type: "ready", shellId: "shell-root", cwd: "/srv/root" });
+  assert.equal(controller.workspace.piCwd, "/tmp/mount-shell-root/srv/root");
+  consume.call(controller, { type: "sshClose", shellId: "shell-root" });
+  await new Promise<void>((resolveTick) => setImmediate(resolveTick));
+  assert.equal(workspaceUri(controller.workspace.target), "ssh://alice@10.0.0.10/home/alice");
+  assert.deepEqual(identities.closed, ["shell-root"]);
 });

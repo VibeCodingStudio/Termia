@@ -8,7 +8,7 @@ import type { CommandRecord } from "./history.ts";
 import { HistoryStore } from "./history.ts";
 import { createIdentityRuntime, type IdentityRuntime } from "./identity-runtime.ts";
 import { ProtocolParser, type ProtocolToken } from "./protocol.ts";
-import { SshChain, type MountOperations } from "./ssh-workspace.ts";
+import { SshChain, type IdentityOperations, type MountOperations } from "./ssh-workspace.ts";
 import { fileWorkspace, type WorkspaceBinding } from "./workspace.ts";
 
 type TerminalContext = Pick<ExtensionCommandContext, "ui">;
@@ -73,9 +73,9 @@ export class TerminalController {
   private readonly observedHistoryIds = new Map<string, number>();
   private readonly manualCommandStartedAt = new Map<string, number>();
 
-  constructor(history: HistoryStore, mounts?: MountOperations) {
+  constructor(history: HistoryStore, mounts?: MountOperations, identities?: IdentityOperations) {
     this.history = history;
-    this.sshChain = new SshChain(fileWorkspace(process.cwd()), "local", mounts);
+    this.sshChain = new SshChain(fileWorkspace(process.cwd()), "local", mounts, identities);
   }
 
   get cwd(): string {
@@ -408,6 +408,22 @@ export class TerminalController {
           this.history.discardActiveCommand(token.parentShellId);
         } catch (error) {
           const message = `termia: ignored SSH workspace event: ${error instanceof Error ? error.message : String(error)}\n`;
+          this.history.appendOutput(message);
+          if (this.attached) process.stderr.write(message);
+          break;
+        }
+        this.shellParents.set(token.shellId, token.parentShellId);
+        this.activeShellId = token.shellId;
+        this.cwdValue = token.cwd;
+        break;
+      case "identityOpen":
+        try {
+          const privateKey = this.identityRuntime?.privateKey;
+          if (privateKey === undefined) throw new Error("identity credentials are unavailable");
+          this.sshChain.openIdentity(token, privateKey);
+          this.history.discardActiveCommand(token.parentShellId);
+        } catch (error) {
+          const message = `termia: ignored identity workspace event: ${error instanceof Error ? error.message : String(error)}\n`;
           this.history.appendOutput(message);
           if (this.attached) process.stderr.write(message);
           break;

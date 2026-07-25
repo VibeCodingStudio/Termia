@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
-import type { SshOpenEvent } from "./protocol.ts";
+import type { IdentityOpenEvent, SshOpenEvent } from "./protocol.ts";
 import {
   fileWorkspace,
   sshWorkspace,
@@ -22,6 +22,7 @@ import {
 
 const MOUNT_TIMEOUT_MS = 10_000;
 const STOP_TIMEOUT_MS = 3_000;
+const CONTROL_START_TIMEOUT_MS = 10_000;
 const WORKSPACE_ROOT = join(tmpdir(), "termia-ssh");
 
 function errorMessage(error: unknown): string {
@@ -204,6 +205,112 @@ async function requireLocalCommand(command: string): Promise<void> {
   throw new Error(`${command} is required on the machine running Pi`);
 }
 
+type IdentityState = {
+  runtime: string;
+  controlPath: string;
+  destination: string;
+};
+
+function identityAlias(shellId: string): string {
+  return `termia-identity-${shellId.replace(/[^A-Za-z0-9.-]/g, "-")}`;
+}
+
+function identityHop(event: IdentityOpenEvent, parent: SshHop, controlPath: string): SshHop {
+  return {
+    shellId: event.shellId,
+    parentShellId: event.parentShellId,
+    destination: `${event.user}@${identityAlias(event.shellId)}`,
+    user: event.user,
+    host: parent.host,
+    port: parent.port,
+    controlPath,
+    localAnchor: true,
+  };
+}
+
+export interface IdentityOperations {
+  open(event: IdentityOpenEvent, parentHops: readonly SshHop[], privateKey: string): Promise<SshHop>;
+  close(shellId: string): Promise<void>;
+  dispose(): Promise<void>;
+}
+
+export class IdentityTransport {
+  private readonly identities = new Map<string, IdentityState>();
+
+  async open(
+    event: IdentityOpenEvent,
+    parentHops: readonly SshHop[],
+    privateKey: string,
+  ): Promise<SshHop> {
+    const parent = parentHops.at(-1);
+    if (parent === undefined || parent.shellId !== event.parentShellId) {
+      throw new Error("Identity workspace parent is not the current SSH leaf");
+    }
+    if (this.identities.has(event.shellId)) {
+      throw new Error(`Identity shell is already open: ${event.shellId}`);
+    }
+    validateField("identity shell id", event.shellId);
+    validateField("identity user", event.user);
+    if (!/^[A-Za-z0-9._-]+$/.test(event.user)) throw new Error("Invalid identity user");
+    if (!isAbsolute(privateKey)) throw new Error("Identity private key must be absolute");
+    await access(privateKey, constants.R_OK);
+    await requireLocalCommand("ssh");
+
+    const runtime = await mkdtemp(join(tmpdir(), "termia-identity-"));
+    await chmod(runtime, 0o700);
+    const alias = identityAlias(event.shellId);
+    const destination = `${event.user}@${alias}`;
+    const controlPath = join(runtime, "control");
+    const bridgePath = join(runtime, "route.bridge");
+    const knownHostsPath = join(runtime, "identity.known_hosts");
+    try {
+      await writeFile(
+        bridgePath,
+        `#!/bin/sh\nexec ${buildRemoteStreamCommand(parentHops, "127.0.0.1", event.port)}\n`,
+        { mode: 0o700 },
+      );
+      await writeFile(knownHostsPath, `${alias} ${event.hostKey}\n`, { mode: 0o600 });
+      await runFile("ssh", [
+        "-M", "-S", controlPath,
+        "-o", "ControlMaster=yes",
+        "-o", "ControlPersist=no",
+        "-o", `ProxyCommand=exec ${quote(bridgePath)}`,
+        "-o", "IdentitiesOnly=yes",
+        "-i", privateKey,
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", `HostKeyAlias=${alias}`,
+        "-o", `UserKnownHostsFile=${knownHostsPath}`,
+        "-fN", destination,
+      ], CONTROL_START_TIMEOUT_MS);
+      this.identities.set(event.shellId, { runtime, controlPath, destination });
+      return identityHop(event, parent, controlPath);
+    } catch (error) {
+      await rm(runtime, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  async close(shellId: string): Promise<void> {
+    const state = this.identities.get(shellId);
+    if (state === undefined) return;
+    this.identities.delete(shellId);
+    await runFile(
+      "ssh",
+      ["-S", state.controlPath, "-O", "exit", state.destination],
+      STOP_TIMEOUT_MS,
+    ).catch(() => {});
+    await rm(state.runtime, { recursive: true, force: true });
+  }
+
+  async dispose(): Promise<void> {
+    for (const shellId of [...this.identities.keys()].reverse()) await this.close(shellId);
+  }
+}
+
 async function isMountPoint(path: string): Promise<boolean> {
   try {
     const [entry, parent] = await Promise.all([stat(path), stat(dirname(path))]);
@@ -370,6 +477,9 @@ export class WorkspaceMount implements MountOperations {
 type HopState = {
   hop: SshHop;
   cwd: string;
+  identity: boolean;
+  routeReady: boolean;
+  routeTask: Promise<void>;
   binding: WorkspaceBinding | undefined;
   mountTask: Promise<void>;
   error: unknown;
@@ -384,12 +494,19 @@ export class SshChain {
   private rootBinding: WorkspaceBinding;
   private rootShellId: string;
   private readonly mounts: MountOperations;
+  private readonly identities: IdentityOperations;
   private readonly hops: HopState[] = [];
 
-  constructor(rootBinding: WorkspaceBinding, rootShellId: string, mounts: MountOperations = new WorkspaceMount()) {
+  constructor(
+    rootBinding: WorkspaceBinding,
+    rootShellId: string,
+    mounts: MountOperations = new WorkspaceMount(),
+    identities: IdentityOperations = new IdentityTransport(),
+  ) {
     this.rootBinding = rootBinding;
     this.rootShellId = rootShellId;
     this.mounts = mounts;
+    this.identities = identities;
   }
 
   get currentBinding(): WorkspaceBinding {
@@ -417,12 +534,18 @@ export class SshChain {
     const state: HopState = {
       hop,
       cwd,
+      identity: false,
+      routeReady: this.hops.at(-1)?.routeReady ?? true,
+      routeTask: this.hops.at(-1)?.routeTask ?? Promise.resolve(),
       binding: undefined,
       mountTask: Promise.resolve(),
       error: undefined,
     };
     this.hops.push(state);
-    state.mountTask = this.mounts.mount(this.hops.map((entry) => entry.hop), cwd).then(
+    const states = [...this.hops];
+    const mount = () => this.mounts.mount(states.map((entry) => entry.hop), cwd);
+    const mountTask = state.routeReady ? mount() : state.routeTask.then(mount);
+    state.mountTask = mountTask.then(
       (binding) => {
         state.binding = this.mounts.updateCwd(binding, state.cwd);
       },
@@ -430,6 +553,48 @@ export class SshChain {
         state.error = error;
       },
     );
+  }
+
+  openIdentity(event: IdentityOpenEvent, privateKey: string): void {
+    const parentState = this.hops.at(-1);
+    const expectedParent = parentState?.hop.shellId ?? this.rootShellId;
+    if (event.parentShellId !== expectedParent || parentState === undefined) {
+      throw new Error(`Identity hop parent ${event.parentShellId} is not the current SSH leaf ${expectedParent}`);
+    }
+    if (this.hops.some((state) => state.hop.shellId === event.shellId)) {
+      throw new Error(`Identity shell is already in the hop chain: ${event.shellId}`);
+    }
+    if (!/^[A-Za-z0-9._-]+$/.test(event.user)) throw new Error("Invalid identity user");
+    const parentStates = [...this.hops];
+    const state: HopState = {
+      hop: identityHop(event, parentState.hop, join(tmpdir(), "termia-identity-pending", "control")),
+      cwd: event.cwd,
+      identity: true,
+      routeReady: false,
+      routeTask: Promise.resolve(),
+      binding: undefined,
+      mountTask: Promise.resolve(),
+      error: undefined,
+    };
+    this.hops.push(state);
+    state.routeTask = (async () => {
+      await parentState.routeTask;
+      state.hop = await this.identities.open(
+        event,
+        parentStates.map((entry) => entry.hop),
+        privateKey,
+      );
+      state.routeReady = true;
+    })();
+    state.mountTask = (async () => {
+      try {
+        await state.routeTask;
+        const binding = await this.mounts.mount([...parentStates.map((entry) => entry.hop), state.hop], state.cwd);
+        state.binding = this.mounts.updateCwd(binding, state.cwd);
+      } catch (error) {
+        state.error = error;
+      }
+    })();
   }
 
   async close(shellId: string): Promise<void> {
@@ -440,6 +605,7 @@ export class SshChain {
     this.hops.pop();
     await leaf.mountTask;
     await this.mounts.unmount(shellId);
+    if (leaf.identity) await this.identities.close(shellId);
   }
 
   async readyBinding(shellId: string): Promise<WorkspaceBinding> {
@@ -527,9 +693,14 @@ export class SshChain {
       if (state === undefined) continue;
       await state.mountTask;
       await this.mounts.unmount(state.hop.shellId).catch(() => {});
-      const chain = states.slice(0, index + 1).map((entry) => entry.hop);
-      await runFile("/bin/sh", ["-c", buildControlExitCommand(chain)], STOP_TIMEOUT_MS).catch(() => {});
+      if (state.identity) {
+        await this.identities.close(state.hop.shellId).catch(() => {});
+      } else {
+        const chain = states.slice(0, index + 1).map((entry) => entry.hop);
+        await runFile("/bin/sh", ["-c", buildControlExitCommand(chain)], STOP_TIMEOUT_MS).catch(() => {});
+      }
     }
     await this.mounts.dispose();
+    await this.identities.dispose();
   }
 }

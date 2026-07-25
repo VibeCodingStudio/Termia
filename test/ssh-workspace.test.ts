@@ -1,20 +1,22 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { SshOpenEvent } from "../extensions/termia/protocol.ts";
+import type { IdentityOpenEvent, SshOpenEvent } from "../extensions/termia/protocol.ts";
 import {
   activeRoute,
   buildRemoteBashCommand,
   buildRemoteExecCommand,
   buildRemoteStreamCommand,
   buildSftpBridgeScript,
+  IdentityTransport,
   prepareWorkspaceMountPath,
   SshChain,
   WorkspaceMount,
   workspaceMountName,
   workspaceMountPath,
+  type IdentityOperations,
   type MountOperations,
 } from "../extensions/termia/ssh-workspace.ts";
 import {
@@ -47,6 +49,16 @@ const openB: SshOpenEvent = {
   port: 2222,
   controlPath: "/tmp/termia-b/control",
   cwd: "/srv/app",
+};
+
+const openRoot: IdentityOpenEvent = {
+  type: "identityOpen",
+  parentShellId: "shell-a",
+  shellId: "shell-root",
+  user: "root",
+  cwd: "/root",
+  port: 45123,
+  hostKey: "ssh-ed25519 AAAA",
 };
 
 const hops: SshHop[] = [openA, openB].map(({ type: _type, cwd: _cwd, ...hop }) => hop);
@@ -103,6 +115,36 @@ class FakeMounts implements MountOperations {
   }
 }
 
+class FakeIdentities implements IdentityOperations {
+  readonly closed: string[] = [];
+  private readonly fail: boolean;
+
+  constructor(fail = false) {
+    this.fail = fail;
+  }
+
+  async open(event: IdentityOpenEvent, parentHops: readonly SshHop[]): Promise<SshHop> {
+    if (this.fail) throw new Error("identity control failed");
+    const parent = parentHops.at(-1)!;
+    return {
+      shellId: event.shellId,
+      parentShellId: event.parentShellId,
+      destination: `${event.user}@termia-identity-${event.shellId}`,
+      user: event.user,
+      host: parent.host,
+      port: parent.port,
+      controlPath: `/tmp/identity-${event.shellId}/control`,
+      localAnchor: true,
+    };
+  }
+
+  async close(shellId: string): Promise<void> {
+    this.closed.push(shellId);
+  }
+
+  async dispose(): Promise<void> {}
+}
+
 test("builds an SFTP relay through control sockets owned by each parent", () => {
   const script = buildSftpBridgeScript(hops);
   assert.match(script, /^#!\/bin\/sh\nexec ssh /);
@@ -146,6 +188,57 @@ test("builds a byte stream through the current route", () => {
   assert.match(command, /termia-b\/control/);
   assert.match(command, /-W/);
   assert.match(command, /127\.0\.0\.1:45123/);
+});
+
+test("opens a pinned local ControlMaster through the parent SSH route", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "termia-identity-transport-test-"));
+  const bin = join(root, "bin");
+  const log = join(root, "ssh.log");
+  const privateKey = join(root, "identity");
+  await mkdir(bin);
+  await writeFile(privateKey, "private", { mode: 0o600 });
+  await writeFile(join(bin, "ssh"), `#!/bin/sh
+for value do printf '%s\n' "$value"; done > "$TERMIA_SSH_TEST_LOG"
+exit 0
+`, { mode: 0o700 });
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath ?? ""}`;
+  process.env.TERMIA_SSH_TEST_LOG = log;
+  const transport = new IdentityTransport();
+  t.after(async () => {
+    await transport.dispose();
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    delete process.env.TERMIA_SSH_TEST_LOG;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const hop = await transport.open(openRoot, [hops[0]!], privateKey);
+  const runtime = join(hop.controlPath, "..");
+  const args = (await readFile(log, "utf8")).trim().split("\n");
+  const files = await readdir(runtime);
+
+  assert.equal((await stat(runtime)).mode & 0o777, 0o700);
+  assert.equal(hop.localAnchor, true);
+  assert.equal(hop.user, "root");
+  assert.equal(hop.host, "10.0.0.10");
+  assert.equal(hop.port, 22);
+  assert.match(hop.destination, /^root@termia-identity-/);
+  assert.ok(args.includes("ControlMaster=yes"));
+  assert.ok(args.includes("ControlPersist=no"));
+  assert.ok(args.includes("IdentitiesOnly=yes"));
+  assert.ok(args.includes("PasswordAuthentication=no"));
+  assert.ok(args.includes("KbdInteractiveAuthentication=no"));
+  assert.ok(args.includes(privateKey));
+  assert.ok(args.some((value) => value.startsWith("ProxyCommand=")));
+  const bridge = files.find((name) => name.endsWith(".bridge"));
+  const knownHosts = files.find((name) => name.endsWith(".known_hosts"));
+  assert.ok(bridge);
+  assert.ok(knownHosts);
+  assert.equal((await stat(join(runtime, bridge))).mode & 0o777, 0o700);
+  assert.equal((await stat(join(runtime, knownHosts))).mode & 0o777, 0o600);
+  assert.match(await readFile(join(runtime, bridge), "utf8"), /termia-a\/control.*127\.0\.0\.1:45123/);
+  assert.match(await readFile(join(runtime, knownHosts), "utf8"), /ssh-ed25519 AAAA/);
 });
 
 test("names mount directories by hop depth and leaf identity", () => {
@@ -280,6 +373,40 @@ test("retains the previous binding when the leaf mount fails", async () => {
     workspaceUri(chain.nearestLiveBinding().target),
     "ssh://alice@10.0.0.10/home/alice",
   );
+});
+
+test("mounts an identity hop and restores its SSH parent on close", async () => {
+  const mounts = new FakeMounts();
+  const identities = new FakeIdentities();
+  const chain = new SshChain(fileWorkspace("/work/project"), "local", mounts, identities);
+  chain.open(openA);
+  await chain.readyBinding("shell-a");
+  chain.openIdentity(openRoot, "/tmp/private-identity");
+
+  assert.equal(chain.contextFor("shell-root").workspaceUri, "ssh://root@10.0.0.10/root");
+  const root = await chain.readyBinding("shell-root");
+  assert.equal(workspaceUri(root.target), "ssh://root@10.0.0.10/root");
+  assert.equal(root.target.scheme === "ssh" ? root.target.hops.at(-1)?.localAnchor : undefined, true);
+
+  await chain.close("shell-root");
+  assert.equal(workspaceUri(chain.currentBinding.target), "ssh://alice@10.0.0.10/home/alice");
+  assert.deepEqual(identities.closed, ["shell-root"]);
+});
+
+test("does not expose a failed identity hop as the parent identity", async () => {
+  const mounts = new FakeMounts();
+  const chain = new SshChain(
+    fileWorkspace("/work/project"),
+    "local",
+    mounts,
+    new FakeIdentities(true),
+  );
+  chain.open(openA);
+  await chain.readyBinding("shell-a");
+  chain.openIdentity(openRoot, "/tmp/private-identity");
+
+  await assert.rejects(() => chain.readyBinding("shell-root"), /identity control failed/);
+  assert.equal(workspaceUri(chain.nearestLiveBinding().target), "ssh://alice@10.0.0.10/home/alice");
 });
 
 test("returns to the latest local cwd after the final hop closes", async () => {

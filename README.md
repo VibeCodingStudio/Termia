@@ -103,6 +103,41 @@ Exiting SSH returns through the retained parent hops and finally to the local
 directory that was active before the first hop. Quitting Pi closes the managed
 SSH connections.
 
+### Managed user switches
+
+Inside a managed SSH shell, Termia also manages these interactive, no-command
+user switches:
+
+```text
+sudo -i
+sudo -s
+sudo -u app -i
+sudo --user=app --shell
+su -
+su - app
+su --login app
+```
+
+After the switch, cwd and history follow the target shell, and Pi file tools,
+`@file`, and concurrent Agent Bash jobs use the effective user. The workspace
+URI changes accordingly, for example from `ssh://klein@host/home/klein` to
+`ssh://root@host/root`. Exiting the switched shell restores the exact parent
+SSH workspace; switches and SSH hops can be nested in either order.
+
+Other forms, including `sudo command`, `sudo -u app command`, `sudo -E -i`,
+`su app`, and `su - app -c command`, run as native `sudo` or `su` commands.
+Using `command sudo`, `command su`, or an absolute executable path also bypasses
+Termia's shell wrappers.
+
+Managed user switching requires a usable system OpenSSH server and
+`ssh-keygen`, or a Dropbear build with isolated authorization-directory support
+and `dropbearkey`, on the active remote host. SFTP must also be available.
+Termia starts a password-disabled, loopback-only sidecar with an ephemeral key;
+the private key remains on the Pi machine and no permanent `authorized_keys`
+file is changed. If these capabilities are missing or the sidecar/mount fails,
+the interactive switched shell remains usable but Pi is not given target-user
+file or Bash access. Termia does not reconnect it automatically.
+
 ## Storage
 
 Termia stores its data under Pi's agent directory:
@@ -123,6 +158,7 @@ configuration.
 - bash, zsh, BusyBox ash, and BusyBox sh interactive shells
 - Pi TUI mode with a persisted session
 - SSHFS and remote SFTP for managed SSH file access
+- Remote OpenSSH or capable Dropbear for managed `sudo`/`su` workspaces
 
 ## Uninstall
 

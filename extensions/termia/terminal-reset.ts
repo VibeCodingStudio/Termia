@@ -72,6 +72,12 @@ export async function runTerminalReset<T extends ResettableWorkspaceRuntime>(
     if (result.cancelled) {
       await disposeStaged(staged);
       staged = undefined;
+      if (result.cleanupError !== undefined) {
+        options.ctx.ui.notify(
+          `Termia session cleanup failed after cancelled Terminal Reset: ${errorMessage(result.cleanupError)}`,
+          "warning",
+        );
+      }
       return { kind: "cancelled" };
     }
 
@@ -79,6 +85,12 @@ export async function runTerminalReset<T extends ResettableWorkspaceRuntime>(
     swapped = true;
     options.current.terminal.dispose();
     staged.terminal.commitStaged();
+    if (result.cleanupError !== undefined) {
+      (replacementContext ?? options.ctx).ui.notify(
+        `Termia session cleanup failed after Terminal Reset: ${errorMessage(result.cleanupError)}`,
+        "warning",
+      );
+    }
   } catch (error) {
     if (staged !== undefined && !swapped) {
       try {

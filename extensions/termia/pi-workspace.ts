@@ -10,6 +10,7 @@ import {
 } from "./active-workspace.ts";
 import {
   prepareSessionHandoff,
+  SessionHandoffError,
   SessionRollbackError,
   type SessionTransitionOptions,
 } from "./session.ts";
@@ -33,6 +34,7 @@ export interface PiWorkspaceAdapter {
 type WorkspaceHandoffResult = {
   cancelled: boolean;
   switched: boolean;
+  cleanupError?: unknown;
   commit?(): unknown | undefined;
   rollback?(): Promise<{
     context?: ExtensionCommandContext;
@@ -161,6 +163,12 @@ export function installPiWorkspaceAdapter(
             "Termia workspace handoff was cancelled; previous Active Workspace retained",
             "warning",
           );
+          if (result.cleanupError !== undefined) {
+            ctx.ui.notify(
+              `Termia session cleanup failed after cancelled handoff: ${errorMessage(result.cleanupError)}`,
+              "warning",
+            );
+          }
           return "cancelled";
         }
         try {
@@ -215,6 +223,26 @@ export function installPiWorkspaceAdapter(
         }
         return "committed";
       } catch (error) {
+        if (!committed && error instanceof SessionHandoffError) {
+          try {
+            prepared.defer(errorMessage(error.handoffError));
+          } catch (deferError) {
+            if (!(deferError instanceof StaleActivationError)) throw deferError;
+          }
+          const restoredCtx = error.context ?? replacementCtx ?? ctx;
+          restoredCtx.ui.notify(
+            `Termia workspace handoff failed: ${errorMessage(error.handoffError)}; previous Active Workspace retained`,
+            "warning",
+          );
+          if (error.cleanupError !== undefined) {
+            restoredCtx.ui.notify(
+              `Termia session cleanup failed after rollback: ${errorMessage(error.cleanupError)}`,
+              "warning",
+            );
+          }
+          adapter.show(restoredCtx);
+          return "cancelled";
+        }
         if (!committed && error instanceof SessionRollbackError) {
           const reason = errorMessage(error);
           options.workspace().failClosed(reason);

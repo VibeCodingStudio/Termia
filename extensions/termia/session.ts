@@ -14,10 +14,29 @@ type HandoffContext = Pick<ExtensionCommandContext, "cwd" | "waitForIdle" | "swi
 export type SessionTransitionOptions = {
   withSession?: WithSession;
 };
-export class SessionRollbackError extends AggregateError {}
-export type PreparedSessionHandoff = {
+export type SessionTransitionResult = {
   cancelled: boolean;
   switched: boolean;
+  cleanupError?: unknown;
+};
+export class SessionHandoffError extends Error {
+  readonly handoffError: unknown;
+  readonly context: ReplacedSessionContext | undefined;
+  readonly cleanupError: unknown | undefined;
+
+  constructor(
+    handoffError: unknown,
+    context?: ReplacedSessionContext,
+    cleanupError?: unknown,
+  ) {
+    super(handoffError instanceof Error ? handoffError.message : String(handoffError));
+    this.handoffError = handoffError;
+    this.context = context;
+    this.cleanupError = cleanupError;
+  }
+}
+export class SessionRollbackError extends AggregateError {}
+export type PreparedSessionHandoff = SessionTransitionResult & {
   commit(): unknown | undefined;
   rollback(): Promise<{
     context?: ReplacedSessionContext;
@@ -90,7 +109,7 @@ export async function handoffSession(
   targetCwd: string,
   root: string,
   options?: SessionTransitionOptions,
-): Promise<{ cancelled: boolean; switched: boolean }> {
+): Promise<SessionTransitionResult> {
   await ctx.waitForIdle();
   const sourceFile = ctx.sessionManager.getSessionFile();
   if (sourceFile === undefined) throw new Error("Termia cannot move an ephemeral Pi session");
@@ -103,12 +122,20 @@ export async function handoffSession(
     ? await ctx.switchSession(replacementFile)
     : await ctx.switchSession(replacementFile, { withSession: options.withSession });
   if (result.cancelled) {
-    retireManagedSession(replacementFile, root);
-    return { cancelled: true, switched: false };
+    const cleanupError = captureRetirementError(replacementFile, root);
+    return {
+      cancelled: true,
+      switched: false,
+      ...(cleanupError === undefined ? {} : { cleanupError }),
+    };
   }
 
-  retireManagedSession(sourceFile, root);
-  return { cancelled: false, switched: true };
+  const cleanupError = captureRetirementError(sourceFile, root);
+  return {
+    cancelled: false,
+    switched: true,
+    ...(cleanupError === undefined ? {} : { cleanupError }),
+  };
 }
 
 export async function prepareSessionHandoff(
@@ -170,11 +197,13 @@ export async function prepareSessionHandoff(
     });
   } catch (error) {
     let cleanupError: unknown | undefined;
+    let restoredContext: ReplacedSessionContext | undefined;
     try {
       if (replacementContext === undefined) {
         cleanupError = captureRetirementError(replacementFile, root);
       } else {
         const rollback = await rollbackSwitch();
+        restoredContext = rollback.context;
         cleanupError = rollback.cleanupError;
       }
     } catch (rollbackError) {
@@ -183,19 +212,14 @@ export async function prepareSessionHandoff(
         "Termia session handoff failed and rollback was unsuccessful",
       );
     }
-    if (cleanupError !== undefined) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "Termia session handoff failed, rollback succeeded, and replacement cleanup failed",
-      );
-    }
-    throw error;
+    throw new SessionHandoffError(error, restoredContext, cleanupError);
   }
   if (result.cancelled) {
-    retireManagedSession(replacementFile, root);
+    const cleanupError = captureRetirementError(replacementFile, root);
     return {
       cancelled: true,
       switched: false,
+      ...(cleanupError === undefined ? {} : { cleanupError }),
       commit: () => {},
       rollback: async () => ({}),
     };
@@ -223,7 +247,7 @@ export async function startManagedSession(
   ctx: HandoffContext,
   root: string,
   options?: SessionTransitionOptions,
-): Promise<{ cancelled: boolean; switched: boolean }> {
+): Promise<SessionTransitionResult> {
   await ctx.waitForIdle();
   if (ctx.sessionManager.getSessionFile() === undefined) {
     throw new Error("Termia mode requires a persisted Pi session");
@@ -234,8 +258,12 @@ export async function startManagedSession(
     ? await ctx.switchSession(replacementFile)
     : await ctx.switchSession(replacementFile, { withSession: options.withSession });
   if (result.cancelled) {
-    retireManagedSession(replacementFile, root);
-    return { cancelled: true, switched: false };
+    const cleanupError = captureRetirementError(replacementFile, root);
+    return {
+      cancelled: true,
+      switched: false,
+      ...(cleanupError === undefined ? {} : { cleanupError }),
+    };
   }
 
   return { cancelled: false, switched: true };
@@ -246,7 +274,7 @@ export async function releaseManagedSession(
   targetSessionFile: string,
   root: string,
   options?: SessionTransitionOptions,
-): Promise<{ cancelled: boolean; switched: boolean }> {
+): Promise<SessionTransitionResult> {
   await ctx.waitForIdle();
   const sourceFile = ctx.sessionManager.getSessionFile();
   if (sourceFile === undefined) throw new Error("Termia cannot move an ephemeral Pi session");

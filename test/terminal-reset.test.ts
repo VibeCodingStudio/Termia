@@ -132,6 +132,43 @@ test("stages, hands off, swaps, then disposes the old runtime", async (t) => {
   ]);
 });
 
+test("commits Terminal Reset when post-switch session archival fails", async (t) => {
+  const cwd = temporaryDirectory(t);
+  const order: string[] = [];
+  const notifications: Array<{ message: string; type: string | undefined }> = [];
+  const replacementCtx = commandContext(true, notifications);
+
+  const result = await runTerminalReset({
+    ctx: commandContext(),
+    localCwd: cwd,
+    current: fakeRuntime("old", order, cwd),
+    root: "/tmp/termia",
+    createStaging: () => fakeRuntime("staged", order, cwd),
+    replace: () => order.push("swap"),
+    handoff: async (_ctx, _target, _root, options) => {
+      await options?.withSession?.(replacementCtx);
+      return {
+        cancelled: false,
+        switched: true,
+        cleanupError: new Error("source archive denied"),
+      };
+    },
+  });
+
+  assert.deepEqual(result, { kind: "committed", context: replacementCtx });
+  assert.deepEqual(order, [
+    `stage:${cwd}`,
+    "swap",
+    "stop:old",
+    "commit:staged",
+    "dispose-workspace:old",
+  ]);
+  assert.deepEqual(notifications, [{
+    message: "Termia session cleanup failed after Terminal Reset: source archive denied",
+    type: "warning",
+  }]);
+});
+
 test("does nothing when Terminal Reset confirmation is declined", async (t) => {
   const cwd = temporaryDirectory(t);
   const order: string[] = [];

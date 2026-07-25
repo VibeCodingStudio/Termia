@@ -22,6 +22,7 @@ import {
   prepareSessionHandoff,
   releaseManagedSession,
   retireManagedSession,
+  SessionHandoffError,
   startManagedSession,
 } from "../extensions/termia/session.ts";
 
@@ -154,6 +155,41 @@ test("switches to a managed session without retiring the original Pi session", a
   assert.equal(existsSync(sourceFile), true);
 });
 
+test("reports source archival failure separately after a successful handoff", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-handoff-cleanup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const sessionDirectory = join(root, "pi-sessions");
+  let replacementFile: string | undefined;
+  let result: Awaited<ReturnType<typeof handoffSession>>;
+
+  try {
+    result = await handoffSession({
+      cwd: sourceCwd,
+      sessionManager: { getSessionFile: () => sourceFile },
+      waitForIdle: async () => undefined,
+      switchSession: async (file) => {
+        replacementFile = file;
+        chmodSync(sessionDirectory, 0o500);
+        return { cancelled: false };
+      },
+    }, targetCwd, root);
+  } finally {
+    chmodSync(sessionDirectory, 0o700);
+  }
+
+  assert.equal(result.cancelled, false);
+  assert.equal(result.switched, true);
+  assert.ok(result.cleanupError instanceof Error);
+  assert.ok(replacementFile);
+  assert.equal(existsSync(replacementFile), true);
+  assert.equal(existsSync(sourceFile), true);
+});
+
 function transactionalContext(
   sourceCwd: string,
   targetCwd: string,
@@ -249,7 +285,7 @@ test("rolls a prepared handoff back to the source session", async (t) => {
   assert.equal(existsSync(replacementFile), false);
 });
 
-test("automatically rolls back when replacement session initialization fails", async (t) => {
+test("returns restored context when replacement session initialization fails", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "termia-failed-handoff-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const sourceCwd = join(root, "source");
@@ -267,7 +303,10 @@ test("automatically rolls back when replacement session initialization fails", a
       root,
       { withSession: async () => { throw failure; } },
     ),
-    (error) => error === failure,
+    (error) => error instanceof SessionHandoffError
+      && error.handoffError === failure
+      && error.context?.cwd === sourceCwd
+      && error.cleanupError === undefined,
   );
 
   assert.equal(switched.length, 2);
@@ -307,12 +346,11 @@ test("reports cleanup separately when failed initialization was successfully rol
     chmodSync(sessionDirectory, 0o700);
   }
 
-  assert.ok(thrown instanceof AggregateError);
-  assert.equal(
-    thrown.message,
-    "Termia session handoff failed, rollback succeeded, and replacement cleanup failed",
-  );
-  assert.equal(thrown.errors[0], failure);
+  assert.ok(thrown instanceof SessionHandoffError);
+  assert.equal(thrown.message, "replacement initialization failed");
+  assert.equal(thrown.handoffError, failure);
+  assert.equal(thrown.context?.cwd, sourceCwd);
+  assert.ok(thrown.cleanupError instanceof Error);
   assert.deepEqual(switched.length, 2);
   assert.equal(existsSync(sourceFile), true);
   assert.equal(existsSync(switched[0]!), true);
@@ -363,6 +401,42 @@ test("reports a thrown prepared rollback without claiming restoration", async (t
   assert.deepEqual(switched, [replacementFile, sourceFile]);
   assert.equal(existsSync(sourceFile), true);
   assert.equal(existsSync(replacementFile), true);
+});
+
+test("keeps prepared cancellation authoritative when replacement cleanup fails", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-prepared-cancel-cleanup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const sessionDirectory = join(root, "pi-sessions");
+  let replacementFile: string | undefined;
+  let handoff: Awaited<ReturnType<typeof prepareSessionHandoff>> | undefined;
+
+  try {
+    handoff = await prepareSessionHandoff({
+      cwd: sourceCwd,
+      sessionManager: { getSessionFile: () => sourceFile },
+      waitForIdle: async () => undefined,
+      switchSession: async (file) => {
+        replacementFile = file;
+        chmodSync(sessionDirectory, 0o500);
+        return { cancelled: true };
+      },
+    }, targetCwd, root);
+  } finally {
+    chmodSync(sessionDirectory, 0o700);
+  }
+
+  assert.ok(handoff);
+  assert.equal(handoff.cancelled, true);
+  assert.equal(handoff.switched, false);
+  assert.ok(handoff.cleanupError instanceof Error);
+  assert.ok(replacementFile);
+  assert.equal(existsSync(replacementFile), true);
+  assert.equal(existsSync(sourceFile), true);
 });
 
 test("commits a prepared handoff even when source archival fails", async (t) => {
@@ -479,6 +553,44 @@ test("retires a fresh managed session when entering Termia mode is cancelled", a
   assert.deepEqual(result, { cancelled: true, switched: false });
   assert.ok(managedFile);
   assert.equal(existsSync(managedFile), false);
+  assert.equal(existsSync(originalFile), true);
+});
+
+test("keeps cancellation authoritative when fresh-session cleanup fails", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-mode-cancel-cleanup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const cwd = join(root, "cwd");
+  mkdirSync(cwd);
+  const original = SessionManager.create(cwd, join(root, "original"));
+  appendTurn(original, "stay here");
+  const originalFile = original.getSessionFile();
+  assert.ok(originalFile);
+  const sessionDirectory = join(root, "pi-sessions");
+  let managedFile: string | undefined;
+  let result: Awaited<ReturnType<typeof startManagedSession>>;
+
+  try {
+    result = await startManagedSession({
+      cwd,
+      sessionManager: { getSessionFile: () => originalFile },
+      waitForIdle: async () => undefined,
+      switchSession: async (file) => {
+        managedFile = file;
+        chmodSync(sessionDirectory, 0o500);
+        return { cancelled: true };
+      },
+    }, root);
+  } finally {
+    chmodSync(sessionDirectory, 0o700);
+  }
+
+  assert.deepEqual(
+    { cancelled: result.cancelled, switched: result.switched },
+    { cancelled: true, switched: false },
+  );
+  assert.ok(result.cleanupError instanceof Error);
+  assert.ok(managedFile);
+  assert.equal(existsSync(managedFile), true);
   assert.equal(existsSync(originalFile), true);
 });
 

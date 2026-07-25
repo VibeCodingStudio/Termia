@@ -236,13 +236,25 @@ async function executeBang(
   const activation = await piWorkspace(state).activate(ctx, outcome.record.shellId);
   if (activation !== "unchanged" || isManagedSession(sourceFile, ROOT)) return;
 
+  let replacementContext: ExtensionCommandContext | undefined;
   const handoff = await handoffSession(
     ctx,
     state.workspaceRuntime.workspace.current().executionDirectory(),
     ROOT,
+    {
+      withSession: async (nextContext) => {
+        replacementContext = nextContext;
+      },
+    },
   );
   if (handoff.cancelled) {
     ctx.ui.notify("Termia session handoff was cancelled", "warning");
+  }
+  if (handoff.cleanupError !== undefined) {
+    (replacementContext ?? ctx).ui.notify(
+      `Termia session cleanup failed: ${errorMessage(handoff.cleanupError)}`,
+      "warning",
+    );
   }
 }
 
@@ -288,10 +300,12 @@ async function toggleTermiaMode(
   const previousEnabled = state.enabled;
   state.enabled = enabling;
   let notifySwitched: (() => void) | undefined;
+  let replacementContext: ExtensionCommandContext | undefined;
   try {
     const result = enabling
       ? await startManagedSession(ctx, ROOT, {
           withSession: async (replacementCtx) => {
+            replacementContext = replacementCtx;
             state.previousSessionFile = currentSessionFile;
             applyMode(state, true);
             showWorkspace(replacementCtx, state);
@@ -310,6 +324,7 @@ async function toggleTermiaMode(
         ? { cancelled: false, switched: false }
         : await releaseManagedSession(ctx, state.previousSessionFile, ROOT, {
             withSession: async (replacementCtx) => {
+              replacementContext = replacementCtx;
               applyMode(state, false);
               state.previousSessionFile = undefined;
               await replaceWorkspaceRuntime(
@@ -323,10 +338,22 @@ async function toggleTermiaMode(
     if (result.cancelled) {
       state.enabled = previousEnabled;
       ctx.ui.notify("Termia mode change was cancelled", "warning");
+      if (result.cleanupError !== undefined) {
+        ctx.ui.notify(
+          `Termia session cleanup failed: ${errorMessage(result.cleanupError)}`,
+          "warning",
+        );
+      }
       return;
     }
     if (result.switched) {
       notifySwitched?.();
+      if (result.cleanupError !== undefined) {
+        (replacementContext ?? ctx).ui.notify(
+          `Termia session cleanup failed: ${errorMessage(result.cleanupError)}`,
+          "warning",
+        );
+      }
       return;
     }
     state.enabled = previousEnabled;
@@ -464,8 +491,10 @@ export default function termia(pi: ExtensionAPI): void {
             return;
           }
           try {
+            let replacementContext: ExtensionCommandContext | undefined;
             const result = await handoffSession(ctx, ctx.cwd, ROOT, {
               withSession: async (replacementCtx) => {
+                replacementContext = replacementCtx;
                 try {
                   await runInvocation(
                     pi,
@@ -480,6 +509,12 @@ export default function termia(pi: ExtensionAPI): void {
             });
             if (result.cancelled) {
               ctx.ui.notify("Termia session handoff was cancelled", "warning");
+            }
+            if (result.cleanupError !== undefined) {
+              (replacementContext ?? ctx).ui.notify(
+                `Termia session cleanup failed: ${errorMessage(result.cleanupError)}`,
+                "warning",
+              );
             }
           } catch (error) {
             ctx.ui.notify(errorMessage(error), "error");

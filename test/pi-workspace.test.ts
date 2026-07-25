@@ -14,7 +14,10 @@ import type {
 } from "../extensions/termia/active-workspace.ts";
 import { StaleActivationError } from "../extensions/termia/active-workspace.ts";
 import { installPiWorkspaceAdapter } from "../extensions/termia/pi-workspace.ts";
-import { SessionRollbackError } from "../extensions/termia/session.ts";
+import {
+  SessionHandoffError,
+  SessionRollbackError,
+} from "../extensions/termia/session.ts";
 
 function summary(uri: string): WorkspaceSummary {
   return {
@@ -238,7 +241,11 @@ test("defers a cancelled handoff without committing Active Workspace", async () 
     enabled: () => true,
     localBash: fakeBash(),
     root: "/tmp/termia",
-    handoff: async () => ({ cancelled: true, switched: false }),
+    handoff: async () => ({
+      cancelled: true,
+      switched: false,
+      cleanupError: new Error("replacement archive denied"),
+    }),
   });
 
   assert.equal(
@@ -249,6 +256,9 @@ test("defers a cancelled handoff without committing Active Workspace", async () 
   assert.equal(deferredReason, "Pi session handoff was cancelled");
   assert.deepEqual(notifications, [{
     message: "Termia workspace handoff was cancelled; previous Active Workspace retained",
+    type: "warning",
+  }, {
+    message: "Termia session cleanup failed after cancelled handoff: replacement archive denied",
     type: "warning",
   }]);
 });
@@ -298,6 +308,61 @@ test("defers when a handoff callback throws before commit", async () => {
   );
   assert.equal(commits, 0);
   assert.equal(deferredReason, "replacement initialization failed");
+});
+
+test("uses the restored context when initialization fails but rollback succeeds", async () => {
+  let commits = 0;
+  let deferredReason: string | undefined;
+  const active = summary("file:///work/project");
+  const pending = {
+    uri: "ssh://klein@server/srv/app",
+    generation: 2 as WorkspaceSummary["generation"],
+    active,
+    readiness: "ready" as const,
+  };
+  const activation: WorkspaceActivation = {
+    kind: "ready",
+    pending,
+    handoffCwd: "/physical/srv/app",
+    commit: () => {
+      commits += 1;
+      return summary(pending.uri);
+    },
+    defer: (reason) => {
+      deferredReason = reason;
+      return { ...pending, readiness: "deferred", reason };
+    },
+  };
+  const titles: string[] = [];
+  const notifications: Array<{ message: string; type: string | undefined }> = [];
+  const restoredCtx = fakeCommandContext(titles, notifications);
+  const adapter = installPiWorkspaceAdapter({
+    pi: fakePi().api,
+    workspace: () => fakeWorkspace(fakeAccess(), activation),
+    enabled: () => true,
+    localBash: fakeBash(),
+    root: "/tmp/termia",
+    handoff: async (_ctx, _cwd, _root, options) => {
+      await options?.withSession?.(fakeCommandContext());
+      throw new SessionHandoffError(
+        new Error("replacement initialization failed"),
+        restoredCtx,
+        new Error("replacement archive denied"),
+      );
+    },
+  });
+
+  assert.equal(await adapter.activate(fakeCommandContext(), "remote"), "cancelled");
+  assert.equal(commits, 0);
+  assert.equal(deferredReason, "replacement initialization failed");
+  assert.deepEqual(titles, ["Termia — file:///work/project"]);
+  assert.deepEqual(notifications, [{
+    message: "Termia workspace handoff failed: replacement initialization failed; previous Active Workspace retained",
+    type: "warning",
+  }, {
+    message: "Termia session cleanup failed after rollback: replacement archive denied",
+    type: "warning",
+  }]);
 });
 
 test("fails closed when replacement initialization and automatic rollback both fail", async () => {

@@ -49,6 +49,31 @@ async function waitForHost(controller: TerminalController, destination: string):
   });
 }
 
+async function waitForIdentity(controller: TerminalController, user: string): Promise<WorkspaceBinding> {
+  return waitFor(`${user} identity workspace`, () => {
+    const binding = controller.workspace;
+    if (binding.target.scheme !== "ssh") return undefined;
+    const leaf = binding.target.hops.at(-1);
+    return leaf?.user === user && leaf.destination.includes("@termia-identity-")
+      ? binding
+      : undefined;
+  });
+}
+
+async function concurrentAgentUsers(
+  controller: TerminalController,
+  binding: WorkspaceBinding,
+): Promise<string[]> {
+  const operations = createModeBashOperations(() => true, createLocalBashOperations(), controller);
+  const output = [[], []] as Buffer[][];
+  const results = await Promise.all(output.map((chunks) => operations.exec("id -un", binding.piCwd, {
+    onData: (data) => chunks.push(data),
+    timeout: 10,
+  })));
+  assert.deepEqual(results, [{ exitCode: 0 }, { exitCode: 0 }]);
+  return output.map((chunks) => Buffer.concat(chunks).toString().trim());
+}
+
 async function waitForLocal(controller: TerminalController): Promise<WorkspaceBinding> {
   return waitFor("local workspace", () => {
     const binding = controller.workspace;
@@ -141,6 +166,46 @@ test("runs a credential-isolated local -> A -> B -> C workspace chain", { skip: 
   const bindingA = await waitForHost(controller, "host-a");
   assert.equal(readFileSync(join(bindingA.mountRoot!, "workspace/a.txt"), "utf8").trim(), "host-a");
   await controller.execute("printf 'agent-a\\n'");
+
+  controller.write("sudo -i\r");
+  const bindingRootA = await waitForIdentity(controller, "root");
+  await controller.execute("cd /root");
+  const rootA = await waitForIdentity(controller, "root");
+  assert.equal(rootA.target.scheme === "ssh" ? rootA.target.hops.at(-1)?.host : undefined,
+    bindingA.target.scheme === "ssh" ? bindingA.target.hops.at(-1)?.host : undefined);
+  assert.equal(rootA.target.scheme === "ssh" ? rootA.target.hops.at(-1)?.port : undefined,
+    bindingA.target.scheme === "ssh" ? bindingA.target.hops.at(-1)?.port : undefined);
+  assert.equal(readFileSync(join(rootA.mountRoot!, "root/root-only.txt"), "utf8").trim(), "root-only");
+  assert.deepEqual(await concurrentAgentUsers(controller, rootA), ["root", "root"]);
+  assert.equal(controller.cwd, "/root");
+  const manualRoot = await controller.execute("id -un");
+  assert.equal(history.readOutput(manualRoot).trim(), "root");
+  assert.equal(new URL(manualRoot.workspaceUri).username, "root");
+
+  controller.write("ssh host-b\r");
+  const bindingBFromRoot = await waitForHost(controller, "host-b");
+  controller.write("sudo -u app -i\r");
+  const bindingAppB = await waitForIdentity(controller, "app");
+  assert.equal(readFileSync(join(bindingAppB.mountRoot!, "home/app/app-only.txt"), "utf8").trim(), "app-only");
+  assert.deepEqual(await concurrentAgentUsers(controller, bindingAppB), ["app", "app"]);
+  await controller.execute("cd /home/app");
+  const manualApp = await controller.execute("id -un");
+  assert.equal(history.readOutput(manualApp).trim(), "app");
+  assert.equal(manualApp.workspaceUri, "ssh://app@host-b/home/app");
+
+  const appShellId = bindingAppB.target.scheme === "ssh" ? bindingAppB.target.hops.at(-1)!.shellId : "";
+  const hostBShellId = bindingBFromRoot.target.scheme === "ssh" ? bindingBFromRoot.target.hops.at(-1)!.shellId : "";
+  const rootAShellId = bindingRootA.target.scheme === "ssh" ? bindingRootA.target.hops.at(-1)!.shellId : "";
+  controller.write("exit\r");
+  await waitForShellReady(controller, hostBShellId);
+  assert.equal(workspaceUri((await waitForHost(controller, "host-b")).target), workspaceUri(bindingBFromRoot.target));
+  controller.write("exit\r");
+  await waitForShellReady(controller, rootAShellId);
+  assert.equal(new URL(workspaceUri((await waitForIdentity(controller, "root")).target)).username, "root");
+  controller.write("exit\r");
+  await waitForShellReady(controller, bindingA.target.scheme === "ssh" ? bindingA.target.hops.at(-1)!.shellId : "");
+  assert.equal(workspaceUri((await waitForHost(controller, "host-a")).target), workspaceUri(bindingA.target));
+  assert.notEqual(appShellId, hostBShellId);
 
   controller.write("ssh host-b\r");
   await waitForHost(controller, "host-b");

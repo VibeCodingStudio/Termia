@@ -6,9 +6,14 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources \
   && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends ca-certificates \
   && apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    openssh-client openssh-server \
+    openssh-client openssh-server sudo \
   && rm -rf /var/lib/apt/lists/* \
-  && useradd --create-home --shell /bin/bash termia
+  && useradd --create-home --shell /bin/bash termia \
+  && useradd --create-home --shell /bin/bash app \
+  && printf '%s\n' \
+    'termia ALL=(root) NOPASSWD: ALL' \
+    'termia ALL=(app) NOPASSWD: ALL' > /etc/sudoers.d/termia-test \
+  && chmod 0440 /etc/sudoers.d/termia-test
 
 COPY entrypoint.sh /usr/local/bin/termia-ssh-entrypoint
 RUN chmod 0755 /usr/local/bin/termia-ssh-entrypoint

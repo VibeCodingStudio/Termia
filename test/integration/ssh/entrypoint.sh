@@ -68,11 +68,29 @@ Host $next_host
 EOF
   chown termia:termia /home/termia/.ssh/config
   chmod 0600 /home/termia/.ssh/config
+  install -d -m 0700 /root/.ssh
+  install -m 0600 /home/termia/.ssh/id_ed25519 /root/.ssh/id_ed25519
+  cat > /root/.ssh/config <<EOF
+Host $next_host
+  HostName $next_host
+  User termia
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+EOF
+  chmod 0600 /root/.ssh/config
 fi
 
 mkdir -p /workspace /run/sshd
 printf '%s\n' "$role" > "/workspace/${role#host-}.txt"
 chown -R termia:termia /workspace
+printf 'root-only\n' > /root/root-only.txt
+chmod 0600 /root/root-only.txt
+printf 'app-only\n' > /home/app/app-only.txt
+chown app:app /home/app/app-only.txt
+chmod 0600 /home/app/app-only.txt
 echo 'termia:termia' | chpasswd
 ssh-keygen -A
 

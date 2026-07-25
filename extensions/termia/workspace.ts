@@ -22,10 +22,6 @@ export type WorkspaceBinding = {
   mountRoot?: string;
 };
 
-const FILE_TOOLS = new Set(["read", "edit", "write", "grep", "find", "ls"]);
-const WORKSPACE_TOOLS = new Set([...FILE_TOOLS, "bash"]);
-const DISCONNECTED_REASON = "Termia SSH workspace is disconnected; run /termia to return to the nearest live workspace";
-const TILDE_REASON = "Termia cannot map ~ paths safely; use an absolute remote path";
 const URI_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
 const SSH_PATH_GUIDANCE = [
   "Termia SSH file paths:",
@@ -161,24 +157,4 @@ export function presentWorkspaceCwd(
     `Current working directory: ${physicalCwd}`,
     `${SSH_PATH_GUIDANCE}\nCurrent working directory: ${workspaceUri(binding.target)}`,
   );
-}
-
-export function applyWorkspaceToolPolicy(
-  event: { toolName: string; input: Record<string, unknown> },
-  binding: WorkspaceBinding,
-  healthy: boolean,
-): { block: boolean; reason?: string } {
-  if (!WORKSPACE_TOOLS.has(event.toolName)) return { block: false };
-  if (FILE_TOOLS.has(event.toolName) && typeof event.input.path === "string") {
-    if (binding.target.scheme === "ssh" && /^~(?:\/|$)/.test(event.input.path)) {
-      return { block: true, reason: TILDE_REASON };
-    }
-    const remote = binding.target.scheme === "ssh" && !isAbsolute(event.input.path);
-    const path = projectWorkspacePath(binding, event.input.path);
-    if (remote && !healthy) return { block: true, reason: DISCONNECTED_REASON };
-    event.input.path = path;
-    return { block: false };
-  }
-  if (binding.target.scheme === "ssh" && !healthy) return { block: true, reason: DISCONNECTED_REASON };
-  return { block: false };
 }

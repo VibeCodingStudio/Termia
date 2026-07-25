@@ -361,7 +361,10 @@ test("pushes only from the current leaf and pops to the retained parent", async 
     /current leaf/,
   );
   await chain.close("shell-b");
-  assert.equal(workspaceUri(chain.currentBinding.target), "ssh://alice@10.0.0.10/home/alice");
+  assert.equal(
+    workspaceUri((await chain.readyBinding("shell-a")).target),
+    "ssh://alice@10.0.0.10/home/alice",
+  );
   assert.deepEqual(mounts.unmounted, ["shell-b"]);
 });
 
@@ -371,7 +374,7 @@ test("updates a mounted leaf cwd without remounting", async () => {
   chain.open(openA);
   await chain.readyBinding("shell-a");
   chain.updateCwd("shell-a", "/srv/new");
-  assert.equal(chain.currentBinding.piCwd, "/tmp/mount-shell-a/srv/new");
+  assert.equal((await chain.readyBinding("shell-a")).piCwd, "/tmp/mount-shell-a/srv/new");
   assert.equal(chain.contextFor("shell-a").workspaceUri, "ssh://alice@10.0.0.10/srv/new");
 });
 
@@ -398,7 +401,7 @@ test("retains the previous binding when the leaf mount fails", async () => {
   chain.open(openB);
   await assert.rejects(() => chain.readyBinding("shell-b"), /SFTP unavailable/);
   assert.equal(
-    workspaceUri(chain.nearestLiveBinding().target),
+    workspaceUri((await chain.readyBinding("shell-a")).target),
     "ssh://alice@10.0.0.10/home/alice",
   );
 });
@@ -417,7 +420,10 @@ test("mounts an identity hop and restores its SSH parent on close", async () => 
   assert.equal(root.target.scheme === "ssh" ? root.target.hops.at(-1)?.localAnchor : undefined, true);
 
   await chain.close("shell-root");
-  assert.equal(workspaceUri(chain.currentBinding.target), "ssh://alice@10.0.0.10/home/alice");
+  assert.equal(
+    workspaceUri((await chain.readyBinding("shell-a")).target),
+    "ssh://alice@10.0.0.10/home/alice",
+  );
   assert.deepEqual(identities.closed, ["shell-root"]);
 });
 
@@ -434,7 +440,10 @@ test("does not expose a failed identity hop as the parent identity", async () =>
   chain.openIdentity(openRoot, "/tmp/private-identity");
 
   await assert.rejects(() => chain.readyBinding("shell-root"), /identity control failed/);
-  assert.equal(workspaceUri(chain.nearestLiveBinding().target), "ssh://alice@10.0.0.10/home/alice");
+  assert.equal(
+    workspaceUri((await chain.readyBinding("shell-a")).target),
+    "ssh://alice@10.0.0.10/home/alice",
+  );
 });
 
 test("returns to the latest local cwd after the final hop closes", async () => {
@@ -443,7 +452,7 @@ test("returns to the latest local cwd after the final hop closes", async () => {
   chain.open(openA);
   await chain.readyBinding("shell-a");
   await chain.close("shell-a");
-  assert.equal(chain.currentBinding.piCwd, "/work/other");
+  assert.equal((await chain.readyBinding("local")).piCwd, "/work/other");
 });
 
 test("waits for a pending mount before unmounting a fast-closing hop", async () => {
@@ -471,5 +480,5 @@ test("waits for a pending mount before unmounting a fast-closing hop", async () 
   const closing = chain.close("shell-a");
   finishMount?.(sshWorkspace([hops[0]!], "/home/alice", "/tmp/mount-shell-a"));
   await closing;
-  assert.equal(chain.currentBinding.piCwd, "/work/project");
+  assert.equal((await chain.readyBinding("local")).piCwd, "/work/project");
 });

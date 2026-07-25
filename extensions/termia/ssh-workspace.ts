@@ -509,10 +509,6 @@ export class SshChain {
     this.identities = identities;
   }
 
-  get currentBinding(): WorkspaceBinding {
-    return this.nearestLiveBinding();
-  }
-
   resetRoot(binding: WorkspaceBinding, shellId: string): void {
     if (this.hops.length > 0) throw new Error("Cannot reset the local workspace while SSH hops are active");
     this.rootBinding = binding;
@@ -631,18 +627,6 @@ export class SshChain {
     if (state === undefined) return;
     state.cwd = cwd;
     if (state.binding !== undefined) state.binding = this.mounts.updateCwd(state.binding, cwd);
-  }
-
-  nearestLiveBinding(): WorkspaceBinding {
-    for (let index = this.hops.length - 1; index >= 0; index -= 1) {
-      const state = this.hops[index];
-      if (
-        state?.binding !== undefined
-        && state.error === undefined
-        && this.mounts.health(state.hop.shellId)
-      ) return state.binding;
-    }
-    return this.rootBinding;
   }
 
   contextFor(shellId: string, cwd?: string): WorkspaceContext {

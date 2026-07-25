@@ -253,6 +253,7 @@ test("does not promote an ancestor until its real close event is committed", asy
     controlPath: "/tmp/termia-leaf-control",
     cwd: "/srv/app",
   });
+  assert.deepEqual(terminal.contextFor("leaf").hopChain, ["parent", "leaf"]);
   const leaf = await workspace.prepare("leaf");
   assert.equal(leaf.kind, "ready");
   leaf.commit();
@@ -264,6 +265,32 @@ test("does not promote an ancestor until its real close event is committed", asy
   assert.equal(workspace.current().summary.uri, "ssh://bob@leaf/srv/app");
   parent.commit();
   assert.equal(workspace.current().summary.uri, "ssh://alice@parent/home/alice");
+});
+
+test("formats an IPv6 Active Workspace URI", async (t) => {
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    new MemoryMounts(),
+    new MemoryIdentities(),
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "ipv6-server",
+    user: "alice",
+    host: "2001:db8::1",
+    port: 22,
+    controlPath: "/tmp/termia-ipv6-control",
+    cwd: "/work",
+  });
+
+  const activation = await workspace.prepare("remote");
+  assert.equal(activation.kind, "ready");
+  assert.equal(activation.pending.uri, "ssh://alice@[2001:db8::1]/work");
 });
 
 test("routes an identity workspace through the same prepare and commit boundary", async (t) => {
@@ -385,6 +412,15 @@ test("routes Agent file paths through the committed Active Workspace", async (t)
     access.filePath("ssh://klein@server/etc/hosts"),
     "/tmp/termia-test-mount/etc/hosts",
   );
+  assert.equal(
+    access.filePath("ssh://klein@server/srv/a%20b.txt"),
+    "/tmp/termia-test-mount/srv/a b.txt",
+  );
+  assert.equal(access.filePath("../../../../etc/hosts"), "/tmp/termia-test-mount/etc/hosts");
+  assert.equal(
+    access.filePath("/tmp/termia-test-mount/srv/app/index.ts"),
+    "/tmp/termia-test-mount/srv/app/index.ts",
+  );
 });
 
 test("rejects unsafe remote path inputs with WorkspacePathError", async (t) => {
@@ -421,8 +457,38 @@ test("rejects unsafe remote path inputs with WorkspacePathError", async (t) => {
     (error) => error instanceof WorkspacePathError && /does not match/.test(error.message),
   );
   assert.throws(
+    () => access.filePath("ssh://[bad"),
+    (error) => error instanceof WorkspacePathError && /Invalid SSH workspace URI/.test(error.message),
+  );
+  assert.throws(
+    () => access.filePath("file:///etc/hosts"),
+    (error) => error instanceof WorkspacePathError && /Unsupported workspace URI/.test(error.message),
+  );
+  assert.throws(
+    () => access.filePath("ssh://klein:secret@server/etc/hosts"),
+    (error) => error instanceof WorkspacePathError && /must not contain a password/.test(error.message),
+  );
+  assert.throws(
+    () => access.filePath("ssh://klein@server/etc/hosts?raw=1"),
+    (error) => error instanceof WorkspacePathError && /must not contain a query or fragment/.test(error.message),
+  );
+  assert.throws(
     () => access.filePath("bad\0path"),
     (error) => error instanceof WorkspacePathError && /NUL/.test(error.message),
+  );
+});
+
+test("preserves native local path handling outside an SSH Active Workspace", (t) => {
+  const { workspace } = createActiveWorkspace("/work/project", fakeDetached());
+  t.after(() => workspace[Symbol.asyncDispose]());
+  const access = workspace.current();
+
+  assert.equal(access.summary.uri, "file:///work/project");
+  assert.equal(access.filePath("/etc/hosts"), "/etc/hosts");
+  assert.equal(access.filePath("~/.ssh/config"), "~/.ssh/config");
+  assert.throws(
+    () => access.filePath("ssh://klein@server/etc/hosts"),
+    (error) => error instanceof WorkspacePathError && /no active SSH workspace/.test(error.message),
   );
 });
 

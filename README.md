@@ -33,6 +33,7 @@ Start `pi` in a persisted session and run `/termia`:
 
 ```text
 /termia           enable or disable Termia
+/termia reset     confirm and replace the terminal with a fresh local terminal
 Ctrl+]            switch between Agent and terminal while the Agent is idle
 !command          run in the persistent shell and add the result to Agent context
 !!command         run in the persistent shell without adding it to Agent context
@@ -91,6 +92,24 @@ remote workspace, while the interface shows a logical cwd such as:
 ```text
 ssh://user@example.com/srv/app
 ```
+
+### Active Workspace and recovery
+
+Agent tools follow the committed Active Workspace, not every transient hop in
+the terminal. A route, mount, or Pi session-handoff failure leaves the terminal
+in a Pending Workspace while the Agent stays in the previous Active Workspace.
+
+If a remote Active Workspace disconnects, Termia retains its `ssh://` identity.
+Remote Agent file operations and Bash are blocked until it is recovered, while
+local absolute file reads remain possible. Closing the failed hop in the
+terminal is the normal recovery path.
+
+`/termia reset` is the explicit fallback. After confirmation, Termia stages a
+fresh local terminal and Pi session, swaps them in only after the handoff
+succeeds, and then discards the old terminal and SSH chain. A failure before the
+runtime swap keeps the old runtime active. Reset is never automatic and loses
+running terminal jobs and process-local shell state. It is not a guarantee of
+recovery from process crashes or failures after the runtime swap completes.
 
 SSH file access requires both SSHFS on the local machine and SFTP on the remote
 host. If file access is unavailable, the interactive SSH shell can continue,

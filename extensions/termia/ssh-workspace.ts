@@ -274,7 +274,7 @@ export class IdentityTransport {
         "-M", "-S", controlPath,
         "-o", "ControlMaster=yes",
         "-o", "ControlPersist=no",
-        "-o", `ProxyCommand=exec ${quote(bridgePath)}`,
+        "-o", `ProxyCommand=${quote(bridgePath)}`,
         "-o", "IdentitiesOnly=yes",
         "-i", privateKey,
         "-o", "PasswordAuthentication=no",

@@ -241,6 +241,34 @@ exit 0
   assert.match(await readFile(join(runtime, knownHosts), "utf8"), /ssh-ed25519 AAAA/);
 });
 
+test("passes an executable bridge path to OpenSSH ProxyCommand", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "termia-proxy-command-test-"));
+  const bin = join(root, "bin");
+  const privateKey = join(root, "identity");
+  await mkdir(bin);
+  await writeFile(privateKey, "private", { mode: 0o600 });
+  await writeFile(join(bin, "ssh"), `#!/bin/sh
+proxy=
+for value do
+  case "$value" in ProxyCommand=*) proxy=\${value#ProxyCommand=} ;; esac
+done
+if [ -n "$proxy" ]; then exec /bin/sh -c "exec $proxy"; fi
+exit 0
+`, { mode: 0o700 });
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath ?? ""}`;
+  const transport = new IdentityTransport();
+  t.after(async () => {
+    await transport.dispose();
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const hop = await transport.open(openRoot, [hops[0]!], privateKey);
+  assert.equal(hop.user, "root");
+});
+
 test("names mount directories by hop depth and leaf identity", () => {
   assert.equal(workspaceMountName([hops[0]!]), "1-alice@10.0.0.10");
   assert.equal(workspaceMountName(hops), "2-bob@10.0.0.20-p2222");

@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import type { IdentityOpenEvent } from "../extensions/termia/protocol.ts";
 import type {
   IdentityOperations,
@@ -7,7 +11,10 @@ import type {
 } from "../extensions/termia/ssh-workspace.ts";
 import {
   createActiveWorkspace,
+  StaleWorkspaceAccessError,
   type DetachedCommandOperations,
+  WorkspacePathError,
+  WorkspaceUnavailableError,
 } from "../extensions/termia/active-workspace.ts";
 import {
   sshWorkspace,
@@ -285,4 +292,311 @@ test("disposes Active Workspace resources exactly once", async () => {
   await workspace[Symbol.asyncDispose]();
 
   assert.equal(mounts.disposeCount, 1);
+});
+
+test("routes Agent file paths through the committed Active Workspace", async (t) => {
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    new MemoryMounts(),
+    new MemoryIdentities(),
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+  const activation = await workspace.prepare("remote");
+  assert.equal(activation.kind, "ready");
+  activation.commit();
+  const access = workspace.current();
+
+  assert.equal(access.filePath("src/index.ts"), "src/index.ts");
+  assert.equal(access.filePath("/etc/hosts"), "/etc/hosts");
+  assert.equal(
+    access.filePath("ssh://klein@server/etc/hosts"),
+    "/tmp/termia-test-mount/etc/hosts",
+  );
+});
+
+test("rejects unsafe remote path inputs with WorkspacePathError", async (t) => {
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    new MemoryMounts(),
+    new MemoryIdentities(),
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+  const activation = await workspace.prepare("remote");
+  assert.equal(activation.kind, "ready");
+  activation.commit();
+  const access = workspace.current();
+
+  assert.throws(
+    () => access.filePath("~/.ssh/config"),
+    (error) => error instanceof WorkspacePathError && /cannot map ~ paths safely/.test(error.message),
+  );
+  assert.throws(
+    () => access.filePath("ssh://other@server/etc/hosts"),
+    (error) => error instanceof WorkspacePathError && /does not match/.test(error.message),
+  );
+  assert.throws(
+    () => access.filePath("bad\0path"),
+    (error) => error instanceof WorkspacePathError && /NUL/.test(error.message),
+  );
+});
+
+test("blocks remote files but permits local absolute files while Active is unavailable", async (t) => {
+  const mounts = new MemoryMounts();
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    mounts,
+    new MemoryIdentities(),
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+  const activation = await workspace.prepare("remote");
+  assert.equal(activation.kind, "ready");
+  activation.commit();
+  const available = workspace.current();
+  mounts.setHealthy("remote", false);
+  const unavailable = workspace.current();
+
+  assert.equal(unavailable.summary.uri, "ssh://klein@server/srv/app");
+  assert.equal(unavailable.summary.availability.kind, "unavailable");
+  assert.notEqual(unavailable.summary.generation, available.summary.generation);
+  assert.equal(unavailable.filePath("/home/klein/local.txt"), "/home/klein/local.txt");
+  assert.throws(
+    () => unavailable.filePath("src/index.ts"),
+    (error) => error instanceof WorkspaceUnavailableError
+      && /ssh:\/\/klein@server\/srv\/app/.test(error.message)
+      && /\/termia reset/.test(error.message),
+  );
+  assert.throws(
+    () => unavailable.filePath("ssh://klein@server/etc/hosts"),
+    WorkspaceUnavailableError,
+  );
+  assert.equal(unavailable.executionDirectory(), "/tmp/termia-test-mount/srv/app");
+  assert.throws(() => available.executionDirectory(), StaleWorkspaceAccessError);
+  await assert.rejects(
+    unavailable.runDetached({
+      command: "pwd",
+      cwd: unavailable.executionDirectory(),
+      options: { onData: () => {} },
+    }),
+    WorkspaceUnavailableError,
+  );
+});
+
+test("delegates remote detached Bash through an encoded SSH command", async (t) => {
+  let delegated: { command: string; cwd: string; timeout: number | undefined } | undefined;
+  const detached: DetachedCommandOperations = {
+    run: async ({ command, cwd, options }) => {
+      delegated = { command, cwd, timeout: options.timeout };
+      options.onData(Buffer.from("remote-output"));
+      return { exitCode: 7 };
+    },
+  };
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    detached,
+    new MemoryMounts(),
+    new MemoryIdentities(),
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+  const activation = await workspace.prepare("remote");
+  assert.equal(activation.kind, "ready");
+  activation.commit();
+  const access = workspace.current();
+  const output: Buffer[] = [];
+
+  const result = await access.runDetached({
+    command: "printf 'hello'\nread value",
+    cwd: access.executionDirectory(),
+    options: { onData: (data) => output.push(data), timeout: 12 },
+  });
+
+  assert.equal(result.exitCode, 7);
+  assert.equal(Buffer.concat(output).toString(), "remote-output");
+  assert.equal(delegated?.cwd, "/tmp/termia-test-mount/srv/app");
+  assert.equal(delegated?.timeout, 12);
+  assert.match(delegated?.command ?? "", /ssh -T -S/);
+  assert.match(delegated?.command ?? "", /\/srv\/app/);
+  assert.doesNotMatch(delegated?.command ?? "", /read value/);
+});
+
+test("presents logical SSH cwd and remote skill paths without exposing mount roots", async (t) => {
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    new MemoryMounts(),
+    new MemoryIdentities(),
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+  const activation = await workspace.prepare("remote");
+  assert.equal(activation.kind, "ready");
+  activation.commit();
+  const access = workspace.current();
+  const localSkill = "/home/klein/.pi/agent/skills/local/SKILL.md";
+  const remoteSkill = "/tmp/termia-test-mount/srv/app/.agents/skills/remote/SKILL.md";
+  const skills = [{ filePath: localSkill }, { filePath: remoteSkill }];
+
+  const presented = access.present({
+    systemPrompt: `Skills:\n${localSkill}\n${remoteSkill}\nCurrent working directory: ${access.executionDirectory()}`,
+    skills,
+  });
+
+  assert.equal(presented.skills, skills);
+  assert.match(presented.systemPrompt, /Current working directory: ssh:\/\/klein@server\/srv\/app/);
+  assert.match(presented.systemPrompt, /relative file paths use the active SSH cwd/i);
+  assert.match(presented.systemPrompt, /local absolute paths stay local/i);
+  assert.match(presented.systemPrompt, /remote absolute paths use ssh:\/\//i);
+  assert.ok(presented.systemPrompt.includes(localSkill));
+  assert.match(
+    presented.systemPrompt,
+    /ssh:\/\/klein@server\/srv\/app\/\.agents\/skills\/remote\/SKILL\.md/,
+  );
+  assert.doesNotMatch(presented.systemPrompt, /\/tmp\/termia-test-mount/);
+});
+
+test("runs local detached Bash without a terminal or controlling tty", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-active-local-"));
+  const cwd = join(root, "cwd");
+  mkdirSync(cwd);
+  const local = createLocalBashOperations();
+  const { workspace } = createActiveWorkspace(cwd, {
+    run: ({ command, cwd: commandCwd, options }) =>
+      local.exec(command, commandCwd, options),
+  });
+  t.after(async () => {
+    await workspace[Symbol.asyncDispose]();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const access = workspace.current();
+  const output: Buffer[] = [];
+
+  const result = await access.runDetached({
+    command: "if [ -t 0 ]; then echo tty; else echo no-tty; fi; if (exec 3</dev/tty) 2>/dev/null; then echo controlling-tty; else echo no-controlling-tty; fi; IFS= read -r value || echo eof",
+    cwd,
+    options: { onData: (data) => output.push(data) },
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(Buffer.concat(output).toString(), "no-tty\nno-controlling-tty\neof\n");
+});
+
+test("keeps concurrent local detached Bash cancellation isolated", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-active-abort-"));
+  const local = createLocalBashOperations();
+  const { workspace } = createActiveWorkspace(root, {
+    run: ({ command, cwd, options }) => local.exec(command, cwd, options),
+  });
+  t.after(async () => {
+    await workspace[Symbol.asyncDispose]();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const access = workspace.current();
+  const abort = new AbortController();
+  const survivorOutput: Buffer[] = [];
+  const killed = access.runDetached({
+    command: "printf killed-start; sleep 30",
+    cwd: root,
+    options: { onData: () => {}, signal: abort.signal },
+  });
+  const survivor = access.runDetached({
+    command: "printf survivor; sleep 0.2; printf done",
+    cwd: root,
+    options: { onData: (data) => survivorOutput.push(data) },
+  });
+  setTimeout(() => abort.abort(), 100);
+
+  await assert.rejects(killed, /^Error: aborted$/);
+  assert.equal((await survivor).exitCode, 0);
+  assert.equal(Buffer.concat(survivorOutput).toString(), "survivordone");
+});
+
+test("keeps local detached Bash usable after an isolated timeout", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-active-timeout-"));
+  const local = createLocalBashOperations();
+  const { workspace } = createActiveWorkspace(root, {
+    run: ({ command, cwd, options }) => local.exec(command, cwd, options),
+  });
+  t.after(async () => {
+    await workspace[Symbol.asyncDispose]();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const access = workspace.current();
+
+  await assert.rejects(
+    access.runDetached({
+      command: "trap '' INT; sleep 30",
+      cwd: root,
+      options: { onData: () => {}, timeout: 0.1 },
+    }),
+    /^Error: timeout:0.1$/,
+  );
+  const output: Buffer[] = [];
+  const result = await access.runDetached({
+    command: "printf after-timeout",
+    cwd: root,
+    options: { onData: (data) => output.push(data) },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(Buffer.concat(output).toString(), "after-timeout");
 });

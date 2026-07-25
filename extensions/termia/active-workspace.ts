@@ -1,8 +1,11 @@
+import { isAbsolute, resolve } from "node:path";
 import type { IdentityOperations, MountOperations } from "./ssh-workspace.ts";
-import { SshChain } from "./ssh-workspace.ts";
+import { buildRemoteBashCommand, SshChain } from "./ssh-workspace.ts";
 import type { SshOpenEvent } from "./protocol.ts";
 import {
   fileWorkspace,
+  presentWorkspaceCwd,
+  projectWorkspacePath,
   workspaceUri,
   type WorkspaceBinding,
 } from "./workspace.ts";
@@ -43,13 +46,25 @@ export type DetachedCommand = {
 export type DetachedCommandResult = { exitCode: number | null };
 
 export class StaleActivationError extends Error {}
+export class StaleWorkspaceAccessError extends Error {}
+export class WorkspacePathError extends Error {}
+export class WorkspaceUnavailableError extends Error {}
 
 export interface DetachedCommandOperations {
   run(input: DetachedCommand): Promise<DetachedCommandResult>;
 }
 
+export type AgentPresentation = {
+  systemPrompt: string;
+  skills: readonly { filePath: string }[];
+};
+
 export interface WorkspaceAccess {
   readonly summary: WorkspaceSummary;
+  executionDirectory(): string;
+  filePath(input: string): string;
+  runDetached(input: DetachedCommand): Promise<DetachedCommandResult>;
+  present(input: AgentPresentation): AgentPresentation;
 }
 
 export type WorkspaceActivation =
@@ -82,6 +97,7 @@ function asGeneration(value: number): WorkspaceGeneration {
 
 class ActiveWorkspaceState {
   private readonly chain: SshChain;
+  private readonly detached: DetachedCommandOperations;
   private active: WorkspaceBinding;
   private generation = 1;
   private topologyRevision = 1;
@@ -91,16 +107,89 @@ class ActiveWorkspaceState {
 
   constructor(
     cwd: string,
+    detached: DetachedCommandOperations,
     mounts: MountOperations | undefined,
     identities: IdentityOperations | undefined,
   ) {
+    this.detached = detached;
     this.active = fileWorkspace(cwd);
     this.chain = new SshChain(this.active, "local", mounts, identities);
   }
 
   current(): WorkspaceAccess {
     this.refreshAvailability();
-    return { summary: this.summary(this.active) };
+    const generation = asGeneration(this.generation);
+    const binding = this.active;
+    return {
+      summary: this.summary(binding),
+      executionDirectory: () => {
+        this.assertCurrent(generation);
+        return binding.piCwd;
+      },
+      filePath: (input) => {
+        this.assertCurrent(generation);
+        try {
+          if (binding.target.scheme === "ssh" && /^~(?:\/|$)/.test(input)) {
+            throw new WorkspacePathError(
+              "Termia cannot map ~ paths safely; use an absolute remote path",
+            );
+          }
+          if (
+            binding.target.scheme === "ssh"
+            && !isAbsolute(input)
+            && this.availability.kind === "unavailable"
+          ) {
+            throw new WorkspaceUnavailableError(this.unavailableMessage());
+          }
+          return projectWorkspacePath(binding, input);
+        } catch (error) {
+          if (
+            error instanceof WorkspacePathError
+            || error instanceof WorkspaceUnavailableError
+          ) throw error;
+          throw new WorkspacePathError(
+            error instanceof Error ? error.message : String(error),
+            { cause: error },
+          );
+        }
+      },
+      runDetached: async (input) => {
+        this.assertCurrent(generation);
+        if (resolve(input.cwd) !== resolve(binding.piCwd)) {
+          throw new Error(
+            `Termia command cwd is outside the Active Workspace: ${input.cwd}`,
+          );
+        }
+        if (
+          binding.target.scheme === "ssh"
+          && this.availability.kind === "unavailable"
+        ) {
+          throw new WorkspaceUnavailableError(this.unavailableMessage());
+        }
+        if (binding.target.scheme === "file") {
+          return this.detached.run(input);
+        }
+        return this.detached.run({
+          ...input,
+          command: buildRemoteBashCommand(
+            binding.target.hops,
+            binding.target.path,
+            input.command,
+          ),
+        });
+      },
+      present: (input) => {
+        this.assertCurrent(generation);
+        return {
+          ...input,
+          systemPrompt: presentWorkspaceCwd(
+            input.systemPrompt,
+            binding,
+            input.skills,
+          ),
+        };
+      },
+    };
   }
 
   async prepare(shellId: string): Promise<WorkspaceActivation> {
@@ -218,15 +307,32 @@ class ActiveWorkspaceState {
     this.availability = next;
     this.generation += 1;
   }
+
+  private assertCurrent(generation: WorkspaceGeneration): void {
+    this.refreshAvailability();
+    if (generation !== asGeneration(this.generation)) {
+      throw new StaleWorkspaceAccessError(
+        `Termia rejected stale Active Workspace access for ${workspaceUri(this.active.target)}`,
+      );
+    }
+  }
+
+  private unavailableMessage(): string {
+    const uri = workspaceUri(this.active.target);
+    const detail = this.availability.kind === "unavailable"
+      ? `: ${this.availability.reason}`
+      : "";
+    return `Termia Active Workspace ${uri} is unavailable${detail}; close the failed SSH hop in the terminal or run /termia reset`;
+  }
 }
 
 export function createActiveWorkspace(
   cwd: string,
-  _detached: DetachedCommandOperations,
+  detached: DetachedCommandOperations,
   mounts?: MountOperations,
   identities?: IdentityOperations,
 ): { workspace: ActiveWorkspace; terminal: TerminalWorkspaceFeed } {
-  const state = new ActiveWorkspaceState(cwd, mounts, identities);
+  const state = new ActiveWorkspaceState(cwd, detached, mounts, identities);
   return {
     workspace: {
       current: () => state.current(),

@@ -38,6 +38,15 @@ export type SshOpenEvent = {
   controlPath: string;
   cwd: string;
 };
+export type IdentityOpenEvent = {
+  type: "identityOpen";
+  parentShellId: string;
+  shellId: string;
+  user: string;
+  cwd: string;
+  port: number;
+  hostKey: string;
+};
 export type SshCloseEvent = { type: "sshClose"; shellId: string };
 export type ProtocolToken =
   | OutputToken
@@ -46,6 +55,7 @@ export type ProtocolToken =
   | CommandEndEvent
   | CommandObservedEvent
   | SshOpenEvent
+  | IdentityOpenEvent
   | SshCloseEvent;
 
 const PREFIX = "\u001b]6973;";
@@ -160,6 +170,26 @@ function parsePayload(payload: string): Exclude<ProtocolToken, OutputToken> | un
       controlPath,
       cwd,
     };
+  }
+  if (kind === "U" && fields.length === 7) {
+    const parentShellId = decodedText(fields[1]);
+    const shellId = decodedText(fields[2]);
+    const user = decodedText(fields[3]);
+    const cwd = decodedAbsolutePath(fields[4]);
+    const port = Number(fields[5]);
+    const hostKey = decodedText(fields[6]);
+    if (
+      parentShellId === undefined
+      || shellId === undefined
+      || user === undefined
+      || cwd === undefined
+      || !Number.isInteger(port)
+      || port < 1
+      || port > 65535
+      || hostKey === undefined
+      || !/^(?:ssh-ed25519|ecdsa-sha2-[^ ]+|ssh-rsa) [A-Za-z0-9+/]+={0,2}$/.test(hostKey)
+    ) return undefined;
+    return { type: "identityOpen", parentShellId, shellId, user, cwd, port, hostKey };
   }
   if (kind === "L" && fields.length === 2) {
     const shellId = decodedText(fields[1]);

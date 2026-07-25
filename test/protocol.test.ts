@@ -116,6 +116,41 @@ test("parses SSH hop open and close frames", () => {
   ]);
 });
 
+test("parses a managed identity open frame", () => {
+  const parser = new ProtocolParser();
+  const open = frame([
+    "U",
+    b64("shell-a"),
+    b64("shell-a.1"),
+    b64("root"),
+    b64("/root"),
+    "45123",
+    b64("ssh-ed25519 AAAA"),
+  ].join(";"));
+  assert.deepEqual(parser.push(open), [{
+    type: "identityOpen",
+    parentShellId: "shell-a",
+    shellId: "shell-a.1",
+    user: "root",
+    cwd: "/root",
+    port: 45123,
+    hostKey: "ssh-ed25519 AAAA",
+  }]);
+});
+
+test("keeps invalid managed identity metadata as terminal output", () => {
+  const parser = new ProtocolParser();
+  const invalid = [
+    frame(`U;${b64("shell-a")};${b64("shell-a.1")};${b64("root")};${b64("/root")};0;${b64("ssh-ed25519 AAAA")}`),
+    frame(`U;${b64("shell-a")};${b64("shell-a.1")};${b64("root")};${b64("relative")};22;${b64("ssh-ed25519 AAAA")}`),
+    frame(`U;${b64("shell-a")};${b64("shell-a.1")};${b64("root")};${b64("/root")};22;${b64("not a key")}`),
+    frame(`U;${b64("shell-a")};${b64("shell-a.1")};${b64("root")};${b64("/root")};22`),
+  ];
+  for (const value of invalid) {
+    assert.deepEqual(parser.push(value), [{ type: "output", data: value }]);
+  }
+});
+
 test("keeps removed Agent job frames as output", () => {
   const parser = new ProtocolParser();
   for (const value of [

@@ -146,19 +146,25 @@ __termia_identity_b64() {
   fi
 }
 
+if (command : > /dev/tty) 2>/dev/null; then
+  __termia_emit() { command printf "$@" > /dev/tty; }
+else
+  __termia_emit() { command printf "$@" >&2; }
+fi
+
 __termia_identity_emit_open() {
-  printf '\033]6973;U;%s;%s;%s;%s;%s;%s\007' \
+  __termia_emit '\033]6973;U;%s;%s;%s;%s;%s;%s\007' \
     "$(printf '%s' "$1" | __termia_identity_b64)" \
     "$(printf '%s' "$2" | __termia_identity_b64)" \
     "$(printf '%s' "$3" | __termia_identity_b64)" \
     "$(printf '%s' "$4" | __termia_identity_b64)" \
     "$5" \
-    "$(printf '%s' "$6" | __termia_identity_b64)" > /dev/tty
+    "$(printf '%s' "$6" | __termia_identity_b64)"
 }
 
 __termia_identity_emit_close() {
-  printf '\033]6973;L;%s\007' \
-    "$(printf '%s' "$1" | __termia_identity_b64)" > /dev/tty
+  __termia_emit '\033]6973;L;%s\007' \
+    "$(printf '%s' "$1" | __termia_identity_b64)"
 }
 
 __termia_identity_shell_supported() {
@@ -260,7 +266,7 @@ AuthorizedKeysFile @RUNTIME@/authorized_keys
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
-UsePAM no
+UsePAM yes
 PermitRootLogin yes
 StrictModes no
 AllowUsers @USER@

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn as spawnProcess } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -92,6 +93,33 @@ function runShellCapture(command: string, env: NodeJS.ProcessEnv): Promise<{ exi
     setTimeout(() => {
       child.kill();
       rejectRun(new Error("Timed out waiting for identity shell capture"));
+    }, 5_000).unref();
+  });
+}
+
+function runWithoutControllingTty(
+  command: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ exitCode: number; output: string }> {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawnProcess("/bin/bash", ["--noprofile", "--norc", "-c", command], {
+      cwd: process.cwd(),
+      detached: true,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout.setEncoding("utf8").on("data", (data) => {
+      output += data;
+    });
+    child.stderr.setEncoding("utf8").on("data", (data) => {
+      output += data;
+    });
+    child.on("error", rejectRun);
+    child.on("close", (exitCode) => resolveRun({ exitCode: exitCode ?? -1, output }));
+    setTimeout(() => {
+      child.kill();
+      rejectRun(new Error("Timed out waiting for detached identity shell capture"));
     }, 5_000).unref();
   });
 }
@@ -210,7 +238,22 @@ test("installs the identity wrapper from the bash hook", async () => {
   assert.equal(exitCode, 0);
 });
 
-test("bootstraps an OpenSSH sidecar and target shell on the original PTY", async (t) => {
+test("emits identity and ready events without a controlling tty", async () => {
+  const result = await runWithoutControllingTty([
+    `export TERMIA_SHELL_ID=child TERMIA_HOOK_DIR=${quote(shellDirectory)}`,
+    `source ${quote(join(shellDirectory, "termia.bash"))}`,
+    "__termia_identity_emit_open parent child klein /home/klein 45678 'ssh-ed25519 AAAA'",
+    "__termia_ready",
+    "__termia_identity_emit_close child",
+  ].join("\n"), process.env);
+
+  assert.equal(result.exitCode, 0);
+  assert.doesNotMatch(result.output, /\/dev\/tty/);
+  const events = new ProtocolParser().push(result.output).filter((token) => token.type !== "output");
+  assert.deepEqual(events.map((event) => event.type), ["identityOpen", "ready", "sshClose"]);
+});
+
+test("bootstraps an OpenSSH sidecar for a locked target account", async (t) => {
   const { bin, hooks, log } = fixture(t);
   writeFileSync(join(bin, "sudo"), `#!/bin/sh
 script=
@@ -238,6 +281,12 @@ printf 'host-private\\n' > "$key"
 printf 'ssh-ed25519 AAAA host\\n' > "$key.pub"
 `);
   writeFileSync(join(bin, "sshd"), `#!/bin/sh
+config=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -f ]; then shift; config=$1; fi
+  shift
+done
+grep -qx 'UsePAM yes' "$config" || exit 76
 trap 'exit 0' TERM INT HUP
 while :; do /bin/sleep 1; done
 `);

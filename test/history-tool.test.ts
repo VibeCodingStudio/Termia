@@ -14,6 +14,9 @@ test("adds fixed operational guidance through the mode-gated history tool", () =
   assert.match(prompt, /local Termia workspace/i);
   assert.match(prompt, /SSH Termia workspace/i);
   assert.match(prompt, /nested SSH/i);
+  assert.match(prompt, /local absolute file paths stay local/i);
+  assert.match(prompt, /remote absolute file paths use ssh:\/\//i);
+  assert.doesNotMatch(prompt, /absolute paths use the remote root/i);
   assert.match(prompt, /high-risk/i);
   assert.match(prompt, /explicitly authorized/i);
   assert.match(prompt, /confirm/i);

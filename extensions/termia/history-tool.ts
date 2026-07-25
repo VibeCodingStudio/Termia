@@ -45,7 +45,7 @@ export const TERMIA_PROMPT_GUIDELINES = [
   "In a local Termia workspace, the interactive PTY persists across Agent and terminal views, and Agent file tools and bash operations target the same active workspace.",
   "In Termia, do not assume that environment or directory changes inside an isolated Agent bash call mutate the interactive PTY.",
   "In Termia, use Termia history when previous commands or output are relevant to the investigation.",
-  "In an SSH Termia workspace, commands and file operations target the active remote workspace rather than the local machine; relative paths use the remote working directory and absolute paths use the remote root.",
+  "In an SSH Termia workspace, commands target the active remote shell; relative file paths use the remote working directory, local absolute file paths stay local, and remote absolute file paths use ssh://user@host/path.",
   "In an SSH Termia workspace, use logical remote paths and never inspect or expose Termia's local mount implementation.",
   "In nested SSH, treat the current leaf host as the active target while retaining the identity of parent hops.",
   "Before changing an SSH Termia workspace, verify the remote host, user, working directory, and privilege level to avoid acting on the wrong machine.",

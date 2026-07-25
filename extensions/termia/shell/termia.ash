@@ -40,7 +40,7 @@ __termia_ready() {
   local __termia_cwd __termia_shell_id
   __termia_shell_id=$(printf '%s' "$TERMIA_SHELL_ID" | __termia_b64)
   __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
-  printf '\033]6973;R;%s;%s;X\007' "$__termia_shell_id" "$__termia_cwd" > /dev/tty
+  __termia_emit '\033]6973;R;%s;%s;X\007' "$__termia_shell_id" "$__termia_cwd"
 }
 
 __termia_complete() {
@@ -62,9 +62,9 @@ __termia_complete() {
   __termia_shell_id=$(printf '%s' "$TERMIA_SHELL_ID" | __termia_b64)
   __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
   __termia_command=$(printf '%s' "$__termia_command" | __termia_b64)
-  printf '\033]6973;C;%s;%s;%s;%s;%s\007' \
+  __termia_emit '\033]6973;C;%s;%s;%s;%s;%s\007' \
     "$__termia_shell_id" "$__termia_history_id" "$__termia_status" \
-    "$__termia_cwd" "$__termia_command" > /dev/tty
+    "$__termia_cwd" "$__termia_command"
 }
 
 __termia_exec() {
@@ -92,13 +92,13 @@ __termia_exec() {
   __termia_agent_sequence=$__termia_sequence
   __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
   __termia_shell_id=$(printf '%s' "$TERMIA_SHELL_ID" | __termia_b64)
-  printf '\033]6973;S;%s;%s;%s;%s\007' \
-    "$__termia_shell_id" "$__termia_agent_sequence" "$__termia_cwd" "$__termia_payload" > /dev/tty
+  __termia_emit '\033]6973;S;%s;%s;%s;%s\007' \
+    "$__termia_shell_id" "$__termia_agent_sequence" "$__termia_cwd" "$__termia_payload"
   eval " $__termia_command"
   __termia_status=$?
   __termia_cwd=$(printf '%s' "$PWD" | __termia_b64)
-  printf '\033]6973;E;%s;%s;%s;%s\007' \
-    "$__termia_shell_id" "$__termia_agent_sequence" "$__termia_status" "$__termia_cwd" > /dev/tty
+  __termia_emit '\033]6973;E;%s;%s;%s;%s\007' \
+    "$__termia_shell_id" "$__termia_agent_sequence" "$__termia_status" "$__termia_cwd"
   __termia_guard=0
   return "$__termia_status"
 }

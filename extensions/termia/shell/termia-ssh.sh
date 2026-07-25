@@ -2,6 +2,12 @@
 __TERMIA_SSH_WRAPPER_INSTALLED=1
 __termia_ssh_sequence=0
 
+if (command : > /dev/tty) 2>/dev/null; then
+  __termia_emit() { command printf "$@" > /dev/tty; }
+else
+  __termia_emit() { command printf "$@" >&2; }
+fi
+
 __termia_real_ssh() {
   command ssh "$@"
 }
@@ -65,7 +71,7 @@ __termia_ssh_unmanaged_master() {
 __termia_ssh_emit_open() {
   local parent_shell_id=$1 child_shell_id=$2 destination=$3 user=$4 host=$5
   local port=$6 control_path=$7 cwd=$8
-  printf '\033]6973;H;%s;%s;%s;%s;%s;%s;%s;%s\007' \
+  __termia_emit '\033]6973;H;%s;%s;%s;%s;%s;%s;%s;%s\007' \
     "$(printf '%s' "$parent_shell_id" | __termia_b64)" \
     "$(printf '%s' "$child_shell_id" | __termia_b64)" \
     "$(printf '%s' "$destination" | __termia_b64)" \
@@ -73,11 +79,11 @@ __termia_ssh_emit_open() {
     "$(printf '%s' "$host" | __termia_b64)" \
     "$port" \
     "$(printf '%s' "$control_path" | __termia_b64)" \
-    "$(printf '%s' "$cwd" | __termia_b64)" > /dev/tty
+    "$(printf '%s' "$cwd" | __termia_b64)"
 }
 
 __termia_ssh_emit_close() {
-  printf '\033]6973;L;%s\007' "$(printf '%s' "$1" | __termia_b64)" > /dev/tty
+  __termia_emit '\033]6973;L;%s\007' "$(printf '%s' "$1" | __termia_b64)"
 }
 
 ssh() {

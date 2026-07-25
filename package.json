@@ -1,6 +1,6 @@
 {
   "name": "@vibecodingstudio/termia",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A Pi-native persistent terminal with command history and managed nested SSH workspaces.",
   "keywords": [
     "pi-package",

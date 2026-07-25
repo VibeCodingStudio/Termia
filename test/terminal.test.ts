@@ -377,10 +377,21 @@ test("allows only one terminal attachment", async (t) => {
 
   let starts = 0;
   let stops = 0;
+  const attachOrder: string[] = [];
+  let finishDrain: (() => void) | undefined;
   const tui = {
     start: () => starts += 1,
-    stop: () => stops += 1,
+    stop: () => {
+      stops += 1;
+      attachOrder.push("stop");
+    },
     requestRender: () => {},
+    terminal: {
+      drainInput: () => new Promise<void>((resolve) => {
+        attachOrder.push("drain");
+        finishDrain = resolve;
+      }),
+    },
   };
   const ctx = {
     ui: {
@@ -391,6 +402,12 @@ test("allows only one terminal attachment", async (t) => {
   } as unknown as Parameters<TerminalController["enter"]>[0];
   const baselineListeners = process.stdin.listenerCount("data");
   const first = controller.enter(ctx);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const beforeRelease = writes.length;
+  process.stdin.emit("data", "\u001b[93;5:3u");
+  assert.equal(writes.length, beforeRelease);
+  assert.equal(process.stdin.listenerCount("data"), baselineListeners);
+  finishDrain?.();
   await new Promise<void>((resolve) => setImmediate(resolve));
   const second = controller.enter(ctx);
 
@@ -404,6 +421,7 @@ test("allows only one terminal attachment", async (t) => {
     ]);
     assert.equal(outcome, "rejected:Error: Termia terminal is already attached");
     assert.equal(process.stdin.listenerCount("data"), baselineListeners + 1);
+    assert.deepEqual(attachOrder, ["drain", "stop"]);
     assert.equal(stops, 1);
     const beforeInput = writes.length;
     process.stdin.emit("data", Buffer.from("password\r"));

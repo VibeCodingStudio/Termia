@@ -272,7 +272,8 @@ StrictModes no
 AllowUsers @USER@
 PermitUserRC no
 AllowAgentForwarding no
-AllowTcpForwarding no
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:*
 X11Forwarding no
 PermitTunnel no
 GatewayPorts no
@@ -331,7 +332,7 @@ __termia_identity_dropbear() {
 
   port=$((40000 + $$ % 20000))
   while [ "$attempts" -lt 16 ]; do
-    "$dropbear_path" -F -E -m -s -j -k -I 300 \
+    "$dropbear_path" -F -E -m -s -k -I 300 \
       -P "$runtime/dropbear.pid" -r "$key" -D "$auth" \
       -p "127.0.0.1:$port" > "$runtime/dropbear.log" 2>&1 &
     pid=$!

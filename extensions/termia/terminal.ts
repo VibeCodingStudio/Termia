@@ -228,7 +228,8 @@ export class TerminalController {
     this.attached = true;
 
     try {
-      return await ctx.ui.custom<TerminalAttachExit>((tui, _theme, _keys, done) => {
+      return await ctx.ui.custom<TerminalAttachExit>(async (tui, _theme, _keys, done) => {
+        await tui.terminal.drainInput();
         const previousRawMode = process.stdin.isRaw;
         let finished = false;
         const resume = () => {

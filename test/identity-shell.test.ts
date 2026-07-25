@@ -287,6 +287,8 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 grep -qx 'UsePAM yes' "$config" || exit 76
+grep -qx 'AllowTcpForwarding local' "$config" || exit 77
+grep -Fqx 'PermitOpen 127.0.0.1:*' "$config" || exit 78
 trap 'exit 0' TERM INT HUP
 while :; do /bin/sleep 1; done
 `);
@@ -365,7 +367,9 @@ printf 'host-private\n' > "$key"
 
   assert.equal(result.exitCode, 0);
   assert.match(result.output, /PORT:\d+ HOST:ssh-ed25519 AAAA/);
-  assert.match(readFileSync(log, "utf8"), /-D .*\/auth/);
+  const args = readFileSync(log, "utf8");
+  assert.match(args, /-D .*\/auth/);
+  assert.doesNotMatch(args, /(?:^|\s)-j(?:\s|$)/);
 });
 
 test("keeps the switched shell unmanaged when no sidecar can start", async (t) => {

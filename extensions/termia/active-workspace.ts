@@ -1,7 +1,11 @@
 import { isAbsolute, resolve } from "node:path";
-import type { IdentityOperations, MountOperations } from "./ssh-workspace.ts";
+import type {
+  IdentityOperations,
+  MountOperations,
+  WorkspaceContext,
+} from "./ssh-workspace.ts";
 import { buildRemoteBashCommand, SshChain } from "./ssh-workspace.ts";
-import type { SshOpenEvent } from "./protocol.ts";
+import type { IdentityOpenEvent, SshOpenEvent } from "./protocol.ts";
 import {
   fileWorkspace,
   presentWorkspaceCwd,
@@ -86,8 +90,10 @@ export interface ActiveWorkspace extends AsyncDisposable {
 export interface TerminalWorkspaceFeed {
   resetRoot(cwd: string, shellId: string): void;
   openSsh(event: SshOpenEvent): void;
+  openIdentity(event: IdentityOpenEvent, privateKey: string): void;
   updateCwd(shellId: string, cwd: string): void;
   close(shellId: string): Promise<void>;
+  contextFor(shellId: string, cwd?: string): WorkspaceContext;
   terminalExited(): Promise<void>;
 }
 
@@ -264,6 +270,11 @@ class ActiveWorkspaceState {
     this.topologyRevision += 1;
   }
 
+  openIdentity(event: IdentityOpenEvent, privateKey: string): void {
+    this.chain.openIdentity(event, privateKey);
+    this.topologyRevision += 1;
+  }
+
   updateCwd(shellId: string, cwd: string): void {
     this.chain.updateCwd(shellId, cwd);
     this.topologyRevision += 1;
@@ -272,6 +283,10 @@ class ActiveWorkspaceState {
   async close(shellId: string): Promise<void> {
     this.topologyRevision += 1;
     await this.chain.close(shellId);
+  }
+
+  contextFor(shellId: string, cwd?: string): WorkspaceContext {
+    return this.chain.contextFor(shellId, cwd);
   }
 
   async terminalExited(): Promise<void> {
@@ -342,8 +357,10 @@ export function createActiveWorkspace(
     terminal: {
       resetRoot: (rootCwd, shellId) => state.resetRoot(rootCwd, shellId),
       openSsh: (event) => state.openSsh(event),
+      openIdentity: (event, privateKey) => state.openIdentity(event, privateKey),
       updateCwd: (shellId, updatedCwd) => state.updateCwd(shellId, updatedCwd),
       close: (shellId) => state.close(shellId),
+      contextFor: (shellId, contextCwd) => state.contextFor(shellId, contextCwd),
       terminalExited: () => state.terminalExited(),
     },
   };

@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { createActiveWorkspace } from "../extensions/termia/active-workspace.ts";
 import { HistoryStore } from "../extensions/termia/history.ts";
+import type { MountOperations } from "../extensions/termia/ssh-workspace.ts";
+import { sshWorkspace } from "../extensions/termia/workspace.ts";
 
 const localContext = { workspaceUri: "file:///tmp", hopChain: [] };
 const hostAContext = { workspaceUri: "ssh://alice@host-a/home/alice", hopChain: ["host-a"] };
@@ -187,4 +190,54 @@ test("migrates pre-SSH history with local provenance defaults", (t) => {
   assert.equal(legacy?.workspaceUri, "file:///tmp");
   assert.deepEqual(legacy?.hopChain, []);
   store.close();
+});
+
+test("records a Pending Workspace command with its terminal provenance", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-history-pending-"));
+  const mounts: MountOperations = {
+    mount: async (hops, cwd) => sshWorkspace(hops, cwd, "/tmp/termia-history-mount"),
+    updateCwd: (binding) => binding,
+    unmount: async () => {},
+    health: () => true,
+    dispose: async () => {},
+  };
+  const facets = createActiveWorkspace(
+    "/work/project",
+    { run: async () => ({ exitCode: 0 }) },
+    mounts,
+  );
+  const store = new HistoryStore(root);
+  t.after(async () => {
+    store.close();
+    await facets.workspace[Symbol.asyncDispose]();
+    rmSync(root, { recursive: true, force: true });
+  });
+  facets.terminal.resetRoot("/work/project", "local");
+  facets.terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-history-control",
+    cwd: "/srv/pending",
+  });
+  store.startTerminal({ id: "pending-terminal", shell: "/bin/bash", cwd: "/work/project" });
+  store.startCommand(
+    { type: "start", shellId: "remote", sequence: 1, cwd: "/srv/pending", command: "pwd" },
+    facets.terminal.contextFor("remote", "/srv/pending"),
+  );
+  const command = store.endCommand({
+    type: "end",
+    shellId: "remote",
+    sequence: 1,
+    cwd: "/srv/pending",
+    exitCode: 0,
+  });
+
+  assert.equal(command?.workspaceUri, "ssh://klein@server/srv/pending");
+  assert.deepEqual(command?.hopChain, ["server"]);
+  assert.equal(facets.workspace.current().summary.uri, "file:///work/project");
 });

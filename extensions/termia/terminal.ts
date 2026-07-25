@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type IDisposable, type IPty } from "node-pty";
 import type { CommandRecord } from "./history.ts";
+import type { TerminalWorkspaceFeed } from "./active-workspace.ts";
 import { HistoryStore } from "./history.ts";
 import { createIdentityRuntime, type IdentityRuntime } from "./identity-runtime.ts";
 import { ProtocolParser, type ProtocolToken } from "./protocol.ts";
@@ -58,6 +59,7 @@ export class TerminalController {
   private readonly listeners = new Set<CommandListener>();
   private readonly history: HistoryStore;
   private readonly sshChain: SshChain;
+  private readonly shadowWorkspaces: TerminalWorkspaceFeed | undefined;
   private identityRuntime: IdentityRuntime | undefined;
   private subscriptions: IDisposable[] = [];
   private pty: IPty | undefined;
@@ -73,9 +75,15 @@ export class TerminalController {
   private readonly observedHistoryIds = new Map<string, number>();
   private readonly manualCommandStartedAt = new Map<string, number>();
 
-  constructor(history: HistoryStore, mounts?: MountOperations, identities?: IdentityOperations) {
+  constructor(
+    history: HistoryStore,
+    mounts?: MountOperations,
+    identities?: IdentityOperations,
+    shadowWorkspaces?: TerminalWorkspaceFeed,
+  ) {
     this.history = history;
     this.sshChain = new SshChain(fileWorkspace(process.cwd()), "local", mounts, identities);
+    this.shadowWorkspaces = shadowWorkspaces;
   }
 
   get cwd(): string {
@@ -115,6 +123,7 @@ export class TerminalController {
 
     const terminalId = randomUUID();
     this.sshChain.resetRoot(fileWorkspace(cwd), terminalId);
+    this.shadowWorkspaces?.resetRoot(cwd, terminalId);
     this.history.startTerminal({ id: terminalId, shell, cwd });
     let child: IPty;
     try {
@@ -298,6 +307,7 @@ export class TerminalController {
     this.identityRuntime?.dispose();
     this.identityRuntime = undefined;
     void this.sshChain.dispose();
+    void this.shadowWorkspaces?.terminalExited().catch(() => {});
   }
 
   async disposeWorkspaces(): Promise<void> {
@@ -329,6 +339,7 @@ export class TerminalController {
         }
         this.cwdValue = token.cwd;
         this.sshChain.updateCwd(token.shellId, token.cwd);
+        this.shadowWorkspaces?.updateCwd(token.shellId, token.cwd);
         this.shellReady = true;
         if (
           this.execution?.aborting
@@ -369,6 +380,7 @@ export class TerminalController {
         this.activeShellId = token.shellId;
         this.cwdValue = token.cwd;
         this.sshChain.updateCwd(token.shellId, token.cwd);
+        this.shadowWorkspaces?.updateCwd(token.shellId, token.cwd);
         const command = this.history.endCommand(token);
         if (command !== undefined) {
           for (const listener of this.listeners) listener(command);
@@ -400,12 +412,14 @@ export class TerminalController {
         this.activeShellId = token.shellId;
         this.cwdValue = token.cwd;
         this.sshChain.updateCwd(token.shellId, token.cwd);
+        this.shadowWorkspaces?.updateCwd(token.shellId, token.cwd);
         for (const listener of this.listeners) listener(command);
         break;
       }
       case "sshOpen":
         try {
           this.sshChain.open(token);
+          this.shadowWorkspaces?.openSsh(token);
           this.history.discardActiveCommand(token.parentShellId);
         } catch (error) {
           const message = `termia: ignored SSH workspace event: ${error instanceof Error ? error.message : String(error)}\n`;
@@ -422,6 +436,7 @@ export class TerminalController {
           const privateKey = this.identityRuntime?.privateKey;
           if (privateKey === undefined) throw new Error("identity credentials are unavailable");
           this.sshChain.openIdentity(token, privateKey);
+          this.shadowWorkspaces?.openIdentity(token, privateKey);
           this.history.discardActiveCommand(token.parentShellId);
         } catch (error) {
           const message = `termia: ignored identity workspace event: ${error instanceof Error ? error.message : String(error)}\n`;
@@ -442,6 +457,7 @@ export class TerminalController {
         this.manualCommandStartedAt.delete(token.shellId);
         if (this.activeShellId === token.shellId && parent !== undefined) this.activeShellId = parent;
         void this.sshChain.close(token.shellId).catch(() => {});
+        void this.shadowWorkspaces?.close(token.shellId).catch(() => {});
         break;
       }
     }
@@ -464,6 +480,7 @@ export class TerminalController {
     this.identityRuntime?.dispose();
     this.identityRuntime = undefined;
     void this.sshChain.dispose();
+    void this.shadowWorkspaces?.terminalExited().catch(() => {});
     const execution = this.execution;
     if (execution !== undefined) {
       this.clearExecution(execution);

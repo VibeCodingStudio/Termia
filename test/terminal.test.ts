@@ -11,8 +11,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import type { IPty } from "node-pty";
+import { createActiveWorkspace } from "../extensions/termia/active-workspace.ts";
 import { HistoryStore, type CommandRecord } from "../extensions/termia/history.ts";
 import type { IdentityOpenEvent, SshOpenEvent } from "../extensions/termia/protocol.ts";
 import type { IdentityOperations, MountOperations } from "../extensions/termia/ssh-workspace.ts";
@@ -70,6 +73,38 @@ test("detects only the Termia PTY marker", () => {
   assert.equal(isTermiaPty("1"), true);
   assert.equal(isTermiaPty("0"), false);
   assert.equal(isTermiaPty(undefined), false);
+});
+
+test("publishes shell workspace facts through TerminalWorkspaceFeed", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-feed-"));
+  const cwd = join(root, "cwd");
+  mkdirSync(join(cwd, "child"), { recursive: true });
+  const store = new HistoryStore(join(root, "state"));
+  const local = createLocalBashOperations();
+  const facets = createActiveWorkspace(cwd, {
+    run: ({ command, cwd: commandCwd, options }) =>
+      local.exec(command, commandCwd, options),
+  });
+  const controller = new TerminalController(
+    store,
+    undefined,
+    undefined,
+    facets.terminal,
+  );
+  t.after(async () => {
+    controller.dispose();
+    await facets.workspace[Symbol.asyncDispose]();
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  controller.start(cwd, "/bin/bash");
+  const record = await controller.execute("cd child");
+  const activation = await facets.workspace.prepare(record.shellId);
+
+  assert.equal(activation.kind, "ready");
+  assert.equal(activation.pending.uri, pathToFileURL(join(cwd, "child")).href);
+  assert.equal(facets.workspace.current().summary.uri, pathToFileURL(cwd).href);
 });
 
 test("uses and removes a private runtime hook directory", async (t) => {

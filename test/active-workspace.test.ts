@@ -63,6 +63,31 @@ class MemoryMounts implements MountOperations {
   }
 }
 
+class DeferredMounts extends MemoryMounts {
+  private releaseMount: (() => void) | undefined;
+  readonly started: Promise<void>;
+  private markStarted: (() => void) | undefined;
+
+  constructor() {
+    super();
+    this.started = new Promise((resolveStarted) => {
+      this.markStarted = resolveStarted;
+    });
+  }
+
+  override async mount(hops: readonly SshHop[], cwd: string): Promise<WorkspaceBinding> {
+    this.markStarted?.();
+    await new Promise<void>((resolveMount) => {
+      this.releaseMount = resolveMount;
+    });
+    return super.mount(hops, cwd);
+  }
+
+  release(): void {
+    this.releaseMount?.();
+  }
+}
+
 class MemoryIdentities implements IdentityOperations {
   privateKey: string | undefined;
   readonly closed: string[] = [];
@@ -189,6 +214,99 @@ test("rejects a ready ticket after terminal topology changes", async (t) => {
   terminal.updateCwd("remote", "/srv/other");
   assert.throws(() => activation.commit(), /stale Active Workspace activation/);
   assert.equal(workspace.current().summary.uri, "file:///work/project");
+});
+
+test("rejects preparation when the terminal closes during mount readiness", async () => {
+  const mounts = new DeferredMounts();
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    mounts,
+    new MemoryIdentities(),
+  );
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+
+  const preparing = workspace.prepare("remote");
+  await mounts.started;
+  const closing = terminal.close("remote");
+  mounts.release();
+  await closing;
+
+  await assert.rejects(preparing, /stale Active Workspace activation/);
+  assert.equal(workspace.current().summary.uri, "file:///work/project");
+  await workspace[Symbol.asyncDispose]();
+});
+
+test("allows only the newest concurrent activation ticket to commit", async (t) => {
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    new MemoryMounts(),
+    new MemoryIdentities(),
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+
+  const first = await workspace.prepare("remote");
+  const second = await workspace.prepare("remote");
+  assert.equal(first.kind, "ready");
+  assert.equal(second.kind, "ready");
+  assert.throws(() => first.commit(), /stale Active Workspace activation/);
+  second.commit();
+  assert.equal(workspace.current().summary.uri, "ssh://klein@server/srv/app");
+});
+
+test("invalidates access and activation tickets when the workspace is disposed", async () => {
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    new MemoryMounts(),
+    new MemoryIdentities(),
+  );
+  const access = workspace.current();
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+  const activation = await workspace.prepare("remote");
+  assert.equal(activation.kind, "ready");
+
+  await workspace[Symbol.asyncDispose]();
+
+  assert.throws(() => access.executionDirectory(), StaleWorkspaceAccessError);
+  assert.throws(() => workspace.current(), StaleWorkspaceAccessError);
+  assert.throws(() => activation.commit(), /stale Active Workspace activation/);
+  await assert.rejects(workspace.prepare("remote"), StaleWorkspaceAccessError);
 });
 
 test("reports a failed mount as Pending and preserves Active", async (t) => {
@@ -532,6 +650,14 @@ test("blocks remote files but permits local absolute files while Active is unava
   );
   assert.throws(
     () => unavailable.filePath("ssh://klein@server/etc/hosts"),
+    WorkspaceUnavailableError,
+  );
+  assert.throws(
+    () => unavailable.filePath("/tmp/termia-test-mount"),
+    WorkspaceUnavailableError,
+  );
+  assert.throws(
+    () => unavailable.filePath("/tmp/termia-test-mount/srv/app/secret.txt"),
     WorkspaceUnavailableError,
   );
   assert.equal(unavailable.executionDirectory(), "/tmp/termia-test-mount/srv/app");

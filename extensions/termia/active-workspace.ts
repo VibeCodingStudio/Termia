@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type {
   IdentityOperations,
   MountOperations,
@@ -108,11 +108,13 @@ class ActiveWorkspaceState {
   private active: WorkspaceBinding;
   private generation = 1;
   private topologyRevision = 1;
+  private activationEpoch = 0;
   private availability: WorkspaceAvailability = { kind: "available" };
   private terminalCleanup: Promise<void> | undefined;
   private finalDisposal: Promise<void> | undefined;
   private rootShellId = "local";
   private localCwdValue: string;
+  private disposed = false;
 
   constructor(
     cwd: string,
@@ -127,6 +129,7 @@ class ActiveWorkspaceState {
   }
 
   current(): WorkspaceAccess {
+    this.assertLive();
     this.refreshAvailability();
     const generation = asGeneration(this.generation);
     const binding = this.active;
@@ -146,8 +149,8 @@ class ActiveWorkspaceState {
           }
           if (
             binding.target.scheme === "ssh"
-            && !isAbsolute(input)
             && this.availability.kind === "unavailable"
+            && this.traversesRemoteMount(binding, input)
           ) {
             throw new WorkspaceUnavailableError(this.unavailableMessage());
           }
@@ -203,11 +206,15 @@ class ActiveWorkspaceState {
   }
 
   async prepare(shellId: string): Promise<WorkspaceActivation> {
+    this.assertLive();
+    const ticketEpoch = ++this.activationEpoch;
+    const preparedAt = this.topologyRevision;
     const active = this.current().summary;
     let binding: WorkspaceBinding;
     try {
       binding = await this.chain.readyBinding(shellId);
     } catch (error) {
+      this.assertPreparationCurrent(ticketEpoch, preparedAt, active.uri);
       return {
         kind: "pending",
         pending: {
@@ -219,6 +226,7 @@ class ActiveWorkspaceState {
         },
       };
     }
+    this.assertPreparationCurrent(ticketEpoch, preparedAt, active.uri);
     if (
       workspaceUri(binding.target) === active.uri
       && binding.piCwd === this.active.piCwd
@@ -231,15 +239,20 @@ class ActiveWorkspaceState {
       active,
       readiness: "ready",
     };
-    const preparedAt = this.topologyRevision;
     let consumed = false;
     const consume = (): void => {
-      if (consumed || preparedAt !== this.topologyRevision) {
+      if (
+        consumed
+        || this.disposed
+        || preparedAt !== this.topologyRevision
+        || ticketEpoch !== this.activationEpoch
+      ) {
         throw new StaleActivationError(
           `Termia rejected stale Active Workspace activation for ${pending.uri}`,
         );
       }
       consumed = true;
+      this.activationEpoch += 1;
     };
     return {
       kind: "ready",
@@ -301,6 +314,10 @@ class ActiveWorkspaceState {
   }
 
   async terminalExited(): Promise<void> {
+    if (this.disposed) {
+      await this.finalDisposal;
+      return;
+    }
     this.topologyRevision += 1;
     this.terminalCleanup ??= this.chain.dispose();
     await this.terminalCleanup;
@@ -308,6 +325,12 @@ class ActiveWorkspaceState {
   }
 
   async dispose(): Promise<void> {
+    if (!this.disposed) {
+      this.disposed = true;
+      this.topologyRevision += 1;
+      this.activationEpoch += 1;
+      this.generation += 1;
+    }
     this.finalDisposal ??= this.terminalCleanup ?? this.chain.dispose();
     await this.finalDisposal;
   }
@@ -335,6 +358,7 @@ class ActiveWorkspaceState {
   }
 
   private assertCurrent(generation: WorkspaceGeneration): void {
+    this.assertLive();
     this.refreshAvailability();
     if (generation !== asGeneration(this.generation)) {
       throw new StaleWorkspaceAccessError(
@@ -349,6 +373,36 @@ class ActiveWorkspaceState {
       ? `: ${this.availability.reason}`
       : "";
     return `Termia Active Workspace ${uri} is unavailable${detail}; close the failed SSH hop in the terminal or run /termia reset`;
+  }
+
+  private assertLive(): void {
+    if (this.disposed) {
+      throw new StaleWorkspaceAccessError("Termia Active Workspace has been disposed");
+    }
+  }
+
+  private assertPreparationCurrent(
+    ticketEpoch: number,
+    preparedAt: number,
+    uri: string,
+  ): void {
+    if (
+      this.disposed
+      || ticketEpoch !== this.activationEpoch
+      || preparedAt !== this.topologyRevision
+    ) {
+      throw new StaleActivationError(
+        `Termia rejected stale Active Workspace activation for ${uri}`,
+      );
+    }
+  }
+
+  private traversesRemoteMount(binding: WorkspaceBinding, input: string): boolean {
+    if (!isAbsolute(input)) return true;
+    if (binding.target.scheme !== "ssh" || binding.mountRoot === undefined) return false;
+    const location = relative(binding.mountRoot, resolve(input));
+    return location === ""
+      || (location !== ".." && !location.startsWith(`..${sep}`) && !isAbsolute(location));
   }
 }
 

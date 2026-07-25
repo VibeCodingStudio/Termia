@@ -9,7 +9,7 @@ import {
   type ActiveWorkspace,
 } from "./active-workspace.ts";
 import {
-  handoffSession,
+  prepareSessionHandoff,
   type SessionTransitionOptions,
 } from "./session.ts";
 
@@ -28,7 +28,19 @@ export interface PiWorkspaceAdapter {
   show(ctx: Pick<ExtensionCommandContext, "ui">): void;
 }
 
-type WorkspaceHandoff = typeof handoffSession;
+type WorkspaceHandoffResult = {
+  cancelled: boolean;
+  switched: boolean;
+  commit?(): void;
+  rollback?(): Promise<ExtensionCommandContext | undefined>;
+};
+
+type WorkspaceHandoff = (
+  ctx: ExtensionCommandContext,
+  targetCwd: string,
+  root: string,
+  options?: SessionTransitionOptions,
+) => Promise<WorkspaceHandoffResult>;
 
 type PiWorkspaceOptions = {
   pi: ExtensionAPI;
@@ -48,7 +60,7 @@ const FILE_TOOLS = new Set(["read", "edit", "write", "grep", "find", "ls"]);
 export function installPiWorkspaceAdapter(
   options: PiWorkspaceOptions,
 ): PiWorkspaceAdapter {
-  const handoff = options.handoff ?? handoffSession;
+  const handoff = options.handoff ?? prepareSessionHandoff;
   const bashOperations: BashOperations = {
     exec: (command, cwd, execOptions) => options.enabled()
       ? options.workspace().current().runDetached({
@@ -62,12 +74,10 @@ export function installPiWorkspaceAdapter(
     options.workspace().current().executionDirectory(),
     {
       operations: bashOperations,
-      spawnHook: (context) => options.enabled()
-        ? {
-            ...context,
-            cwd: options.workspace().current().executionDirectory(),
-          }
-        : context,
+      spawnHook: (context) => ({
+        ...context,
+        cwd: options.workspace().current().executionDirectory(),
+      }),
     },
   ));
   options.pi.on("tool_call", (event) => {
@@ -139,8 +149,35 @@ export function installPiWorkspaceAdapter(
           );
           return "cancelled";
         }
-        prepared.commit();
-        committed = true;
+        try {
+          prepared.commit();
+          committed = true;
+        } catch (commitError) {
+          if (result.rollback === undefined) throw commitError;
+
+          let restoredCtx: ExtensionCommandContext | undefined;
+          try {
+            restoredCtx = await result.rollback();
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [commitError, rollbackError],
+              "Termia workspace activation failed and Pi session rollback was unsuccessful",
+            );
+          }
+          try {
+            prepared.defer(errorMessage(commitError));
+          } catch (deferError) {
+            if (!(deferError instanceof StaleActivationError)) throw deferError;
+          }
+          const rollbackCtx = restoredCtx ?? replacementCtx ?? ctx;
+          rollbackCtx.ui.notify(
+            `Termia workspace handoff rolled back: ${errorMessage(commitError)}; previous Active Workspace retained`,
+            "warning",
+          );
+          adapter.show(rollbackCtx);
+          return "cancelled";
+        }
+        result.commit?.();
         adapter.show(replacementCtx ?? ctx);
         return "committed";
       } catch (error) {

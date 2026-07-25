@@ -9,12 +9,16 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import test from "node:test";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  SessionManager,
+  type ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import {
   createManagedSession,
   forkManagedSession,
   handoffSession,
   isManagedSession,
+  prepareSessionHandoff,
   releaseManagedSession,
   retireManagedSession,
   startManagedSession,
@@ -147,6 +151,126 @@ test("switches to a managed session without retiring the original Pi session", a
   assert.ok(switchedFile);
   assert.equal(isManagedSession(switchedFile, root), true);
   assert.equal(existsSync(sourceFile), true);
+});
+
+function transactionalContext(
+  sourceCwd: string,
+  targetCwd: string,
+  sourceFile: string,
+  switched: string[],
+): ExtensionCommandContext {
+  type SwitchOptions = NonNullable<Parameters<ExtensionCommandContext["switchSession"]>[1]>;
+  type ReplacedSessionContext = Parameters<NonNullable<SwitchOptions["withSession"]>>[0];
+  const restored = {
+    cwd: sourceCwd,
+    sendMessage: async () => {},
+    sendUserMessage: async () => {},
+  } as unknown as ReplacedSessionContext;
+  const replacement = {
+    cwd: targetCwd,
+    sendMessage: async () => {},
+    sendUserMessage: async () => {},
+    switchSession: async (file: string, options?: {
+      withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+    }) => {
+      switched.push(file);
+      assert.equal(file, sourceFile);
+      await options?.withSession?.(restored);
+      return { cancelled: false };
+    },
+  } as unknown as ReplacedSessionContext;
+  return {
+    cwd: sourceCwd,
+    sessionManager: { getSessionFile: () => sourceFile },
+    waitForIdle: async () => undefined,
+    switchSession: async (file: string, options?: SwitchOptions) => {
+      switched.push(file);
+      await options?.withSession?.(replacement);
+      return { cancelled: false };
+    },
+  } as unknown as ExtensionCommandContext;
+}
+
+test("keeps the source session recoverable until a prepared handoff commits", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-prepared-handoff-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const switched: string[] = [];
+
+  const handoff = await prepareSessionHandoff(
+    transactionalContext(sourceCwd, targetCwd, sourceFile, switched),
+    targetCwd,
+    root,
+  );
+  assert.equal(handoff.cancelled, false);
+  assert.equal(handoff.switched, true);
+  assert.equal(existsSync(sourceFile), true);
+  assert.equal(switched.length, 1);
+  const replacementFile = switched[0]!;
+  assert.equal(existsSync(replacementFile), true);
+
+  handoff.commit();
+
+  assert.equal(existsSync(sourceFile), false);
+  assert.equal(existsSync(replacementFile), true);
+});
+
+test("rolls a prepared handoff back to the source session", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-rollback-handoff-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const switched: string[] = [];
+
+  const handoff = await prepareSessionHandoff(
+    transactionalContext(sourceCwd, targetCwd, sourceFile, switched),
+    targetCwd,
+    root,
+  );
+  assert.equal(handoff.cancelled, false);
+  const replacementFile = switched[0]!;
+
+  const restored = await handoff.rollback();
+
+  assert.equal(restored?.cwd, sourceCwd);
+  assert.deepEqual(switched, [replacementFile, sourceFile]);
+  assert.equal(existsSync(sourceFile), true);
+  assert.equal(existsSync(replacementFile), false);
+});
+
+test("automatically rolls back when replacement session initialization fails", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-failed-handoff-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const switched: string[] = [];
+  const failure = new Error("replacement initialization failed");
+
+  await assert.rejects(
+    prepareSessionHandoff(
+      transactionalContext(sourceCwd, targetCwd, sourceFile, switched),
+      targetCwd,
+      root,
+      { withSession: async () => { throw failure; } },
+    ),
+    (error) => error === failure,
+  );
+
+  assert.equal(switched.length, 2);
+  const replacementFile = switched[0]!;
+  assert.deepEqual(switched, [replacementFile, sourceFile]);
+  assert.equal(existsSync(sourceFile), true);
+  assert.equal(existsSync(replacementFile), false);
 });
 
 test("starts Termia mode in a fresh managed session without copying the conversation", async (t) => {

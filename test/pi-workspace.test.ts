@@ -12,6 +12,7 @@ import type {
   WorkspaceActivation,
   WorkspaceSummary,
 } from "../extensions/termia/active-workspace.ts";
+import { StaleActivationError } from "../extensions/termia/active-workspace.ts";
 import { installPiWorkspaceAdapter } from "../extensions/termia/pi-workspace.ts";
 
 function summary(uri: string): WorkspaceSummary {
@@ -22,11 +23,14 @@ function summary(uri: string): WorkspaceSummary {
   };
 }
 
-function fakeAccess(uri = "file:///work/project"): WorkspaceAccess {
+function fakeAccess(
+  uri = "file:///work/project",
+  executionDirectory = "/physical/work/project",
+): WorkspaceAccess {
   const current = summary(uri);
   return {
     summary: current,
-    executionDirectory: () => "/physical/work/project",
+    executionDirectory: () => executionDirectory,
     filePath: (path) => path,
     runDetached: async () => ({ exitCode: 0 }),
     present: (input) => input,
@@ -294,6 +298,67 @@ test("defers when a handoff callback throws before commit", async () => {
   assert.equal(deferredReason, "replacement initialization failed");
 });
 
+test("rolls the Pi session back when topology invalidates the activation after handoff", async () => {
+  const order: string[] = [];
+  const active = summary("file:///work/project");
+  const pending = {
+    uri: "ssh://klein@server/srv/app",
+    generation: 2 as WorkspaceSummary["generation"],
+    active,
+    readiness: "ready" as const,
+  };
+  let topologyChanged = false;
+  const notifications: Array<{ message: string; type: string | undefined }> = [];
+  const restoredContext = fakeCommandContext([], notifications);
+  const activation: WorkspaceActivation = {
+    kind: "ready",
+    pending,
+    handoffCwd: "/physical/srv/app",
+    commit: () => {
+      order.push("commit-active");
+      if (topologyChanged) throw new StaleActivationError("topology changed");
+      return summary(pending.uri);
+    },
+    defer: (reason) => {
+      order.push(`defer:${reason}`);
+      return { ...pending, readiness: "deferred", reason };
+    },
+  };
+  const adapter = installPiWorkspaceAdapter({
+    pi: fakePi().api,
+    workspace: () => fakeWorkspace(fakeAccess(), activation),
+    enabled: () => true,
+    localBash: fakeBash(),
+    root: "/tmp/termia",
+    handoff: async (_ctx, _cwd, _root, options) => {
+      await options?.withSession?.(fakeCommandContext());
+      topologyChanged = true;
+      order.push("topology-changed");
+      return {
+        cancelled: false,
+        switched: true,
+        commit: () => order.push("commit-session"),
+        rollback: async () => {
+          order.push("rollback-session");
+          return restoredContext;
+        },
+      };
+    },
+  });
+
+  assert.equal(await adapter.activate(fakeCommandContext(), "remote"), "cancelled");
+  assert.deepEqual(order, [
+    "topology-changed",
+    "commit-active",
+    "rollback-session",
+    "defer:topology changed",
+  ]);
+  assert.deepEqual(notifications, [{
+    message: "Termia workspace handoff rolled back: topology changed; previous Active Workspace retained",
+    type: "warning",
+  }]);
+});
+
 test("reports a blocked Pending Workspace without changing the title", async () => {
   const active = summary("file:///work/project");
   const activation: WorkspaceActivation = {
@@ -472,4 +537,44 @@ test("leaves Pi workspace hooks local while Termia is disabled", async () => {
     }, fakeCommandContext()),
     undefined,
   );
+});
+
+test("uses the replacement local cwd for disabled Bash after a session change", async () => {
+  const calls: string[] = [];
+  const localBash: BashOperations = {
+    exec: async (command, cwd) => {
+      calls.push(`${command}:${cwd}`);
+      return { exitCode: 0 };
+    },
+  };
+  const first = fakeAccess("file:///work/first", "/physical/work/first");
+  const replacement = fakeAccess("file:///work/replacement", "/physical/work/replacement");
+  let current = fakeWorkspace(
+    first,
+    { kind: "unchanged", active: first.summary },
+  );
+  const pi = fakePi();
+  installPiWorkspaceAdapter({
+    pi: pi.api,
+    workspace: () => current,
+    enabled: () => false,
+    localBash,
+    root: "/tmp/termia",
+  });
+  current = fakeWorkspace(
+    replacement,
+    { kind: "unchanged", active: replacement.summary },
+  );
+
+  const bash = pi.tools.find((tool) => tool.name === "bash");
+  assert.ok(bash);
+  await bash.execute(
+    "bash-replacement",
+    { command: "pwd" },
+    undefined,
+    undefined,
+    { ...fakeCommandContext(), cwd: "/context/replacement" },
+  );
+
+  assert.deepEqual(calls, ["pwd:/physical/work/replacement"]);
 });

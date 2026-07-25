@@ -25,7 +25,7 @@
 - Consumes: Git tags named `v<package.json version>` and npm's GitHub Actions OIDC provider.
 - Produces: A verified `npm publish --access public` run for matching release tags.
 
-- [ ] **Step 1: Create the workflow**
+- [x] **Step 1: Create the workflow**
 
 ```yaml
 name: Publish
@@ -58,12 +58,12 @@ jobs:
       - run: npm publish --access public
 ```
 
-- [ ] **Step 2: Validate the workflow and package**
+- [x] **Step 2: Validate the workflow and package**
 
 Run:
 
 ```bash
-ruby -e 'require "yaml"; YAML.load_file(".github/workflows/publish.yml", aliases: true); puts "valid YAML"'
+python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/publish.yml")); print("valid YAML")'
 npm ci
 npm run typecheck
 npm test
@@ -73,7 +73,7 @@ npm publish --dry-run --access public
 Expected: YAML prints `valid YAML`; dependency installation, typecheck, tests,
 and the publish dry run all succeed.
 
-- [ ] **Step 3: Commit and push the configuration**
+- [x] **Step 3: Commit and push the configuration**
 
 ```bash
 git add .github/workflows/publish.yml

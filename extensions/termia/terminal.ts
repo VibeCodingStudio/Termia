@@ -29,6 +29,15 @@ type ActiveExecution = {
   resolve: (record: CommandRecord) => void;
   reject: (error: Error) => void;
 };
+type StagedTerminal = {
+  metadata: { id: string; shell: string; cwd: string };
+  parser: ProtocolParser;
+  bufferedData: string[];
+  ready: boolean;
+  settled: boolean;
+  resolve(): void;
+  reject(error: Error): void;
+};
 
 const SHELL_DIRECTORY = resolve(dirname(fileURLToPath(import.meta.url)), "./shell");
 const EXPLICIT_EXEC_CHUNK_SIZE = 256;
@@ -60,6 +69,8 @@ export class TerminalController {
   private identityRuntime: IdentityRuntime | undefined;
   private subscriptions: IDisposable[] = [];
   private pty: IPty | undefined;
+  private staged: StagedTerminal | undefined;
+  private historyOwned = false;
   private execution: ActiveExecution | undefined;
   private detach: ((result: TerminalAttachExit) => void) | undefined;
   private attached = false;
@@ -86,6 +97,44 @@ export class TerminalController {
   }
 
   start(cwd: string, shell = process.env.SHELL ?? "/bin/bash"): void {
+    this.launch(cwd, shell);
+  }
+
+  stage(cwd: string, shell = process.env.SHELL ?? "/bin/bash"): Promise<void> {
+    if (this.pty !== undefined) {
+      return Promise.reject(new Error("Termia shell is already running"));
+    }
+    return new Promise((resolveStage, rejectStage) => {
+      try {
+        this.launch(cwd, shell, {
+          resolve: resolveStage,
+          reject: rejectStage,
+        });
+      } catch (error) {
+        rejectStage(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  commitStaged(): void {
+    const staged = this.staged;
+    if (staged === undefined || this.pty === undefined) {
+      throw new Error("Termia has no staged terminal to commit");
+    }
+    if (!staged.ready) throw new Error("Termia staged terminal is not ready");
+
+    this.history.startTerminal(staged.metadata);
+    this.historyOwned = true;
+    this.staged = undefined;
+    for (const data of staged.bufferedData) this.consume(data);
+    staged.bufferedData.length = 0;
+  }
+
+  private launch(
+    cwd: string,
+    shell: string,
+    stageCallbacks?: Pick<StagedTerminal, "resolve" | "reject">,
+  ): void {
     if (this.pty !== undefined) return;
     if (!statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
     const hook = shellHook(shell);
@@ -94,7 +143,22 @@ export class TerminalController {
 
     const terminalId = randomUUID();
     this.workspaces.resetRoot(cwd, terminalId);
-    this.history.startTerminal({ id: terminalId, shell, cwd });
+    const metadata = { id: terminalId, shell, cwd };
+    const staged: StagedTerminal | undefined = stageCallbacks === undefined
+      ? undefined
+      : {
+          metadata,
+          parser: new ProtocolParser(),
+          bufferedData: [],
+          ready: false,
+          settled: false,
+          ...stageCallbacks,
+        };
+    this.staged = staged;
+    if (staged === undefined) {
+      this.history.startTerminal(metadata);
+      this.historyOwned = true;
+    }
     let child: IPty;
     try {
       child = spawn(shell, ["-i"], {
@@ -112,7 +176,12 @@ export class TerminalController {
     } catch (error) {
       identityRuntime.dispose();
       this.identityRuntime = undefined;
-      this.history.endTerminal();
+      this.staged = undefined;
+      if (this.historyOwned) {
+        this.history.endTerminal();
+        this.historyOwned = false;
+      }
+      void this.workspaces.terminalExited().catch(() => {});
       throw error;
     }
 
@@ -126,13 +195,14 @@ export class TerminalController {
     this.shellReady = false;
     this.pty = child;
     this.subscriptions = [
-      child.onData((data: string) => this.consume(data)),
+      child.onData((data: string) => this.consumeIncoming(data)),
       child.onExit(() => this.finish(child)),
     ];
     child.write(` . ${shellQuote(resolve(identityRuntime.hookDirectory, `termia.${hook}`))}\r`);
   }
 
   write(data: string | Buffer): void {
+    this.assertCommitted();
     if (this.pty === undefined) throw new Error("Termia shell is not running");
     const submitted = typeof data === "string"
       ? data.includes("\r") || data.includes("\n")
@@ -147,6 +217,7 @@ export class TerminalController {
   }
 
   async execute(command: string, options: ExecuteOptions = {}): Promise<CommandRecord> {
+    this.assertCommitted();
     if (command.trim().length === 0) throw new Error("Termia command cannot be empty");
     if (command.includes("\u0000")) throw new Error("Termia command cannot contain NUL bytes");
     if (this.pty === undefined) throw new Error("Termia shell is not running");
@@ -197,6 +268,7 @@ export class TerminalController {
   }
 
   async enter(ctx: TerminalContext): Promise<TerminalAttachExit> {
+    this.assertCommitted();
     if (this.pty === undefined) {
       throw new Error("Termia shell is not running");
     }
@@ -281,6 +353,23 @@ export class TerminalController {
 
   private consume(data: string): void {
     for (const token of this.parser.push(data)) this.consumeToken(token);
+  }
+
+  private consumeIncoming(data: string): void {
+    const staged = this.staged;
+    if (staged === undefined) {
+      this.consume(data);
+      return;
+    }
+    staged.bufferedData.push(data);
+    if (staged.ready) return;
+    for (const token of staged.parser.push(data)) {
+      if (token.type !== "ready") continue;
+      staged.ready = true;
+      staged.settled = true;
+      staged.resolve();
+      break;
+    }
   }
 
   private consumeToken(token: ProtocolToken): void {
@@ -424,7 +513,17 @@ export class TerminalController {
 
   private finish(child: IPty): void {
     if (this.pty !== child) return;
-    for (const token of this.parser.flush()) this.consumeToken(token);
+    const staged = this.staged;
+    if (staged === undefined) {
+      for (const token of this.parser.flush()) this.consumeToken(token);
+    } else {
+      this.staged = undefined;
+      staged.bufferedData.length = 0;
+      if (!staged.settled) {
+        staged.settled = true;
+        staged.reject(new Error("Termia staged terminal exited before shell ready"));
+      }
+    }
     for (const subscription of this.subscriptions) subscription.dispose();
     this.subscriptions = [];
     this.pty = undefined;
@@ -435,7 +534,10 @@ export class TerminalController {
     this.promptBoundaries.clear();
     this.observedHistoryIds.clear();
     this.manualCommandStartedAt.clear();
-    this.history.endTerminal();
+    if (this.historyOwned) {
+      this.history.endTerminal();
+      this.historyOwned = false;
+    }
     this.identityRuntime?.dispose();
     this.identityRuntime = undefined;
     void this.workspaces.terminalExited().catch(() => {});
@@ -450,6 +552,12 @@ export class TerminalController {
   private clearExecution(execution: ActiveExecution): void {
     execution.signal?.removeEventListener("abort", execution.abort);
     if (this.execution === execution) this.execution = undefined;
+  }
+
+  private assertCommitted(): void {
+    if (this.staged !== undefined) {
+      throw new Error("Termia staged terminal is not committed");
+    }
   }
 
   private writeExecution(execution: ActiveExecution): void {

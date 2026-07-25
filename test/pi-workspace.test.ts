@@ -356,6 +356,32 @@ test("marks an unavailable Active Workspace in the title", () => {
   assert.deepEqual(titles, ["Termia — ssh://klein@server/srv/app · unavailable"]);
 });
 
+test("keeps Pi hooks attached when Terminal Reset replaces the workspace core", () => {
+  const first = fakeAccess("file:///work/first");
+  const second = fakeAccess("file:///work/reset");
+  let current = fakeWorkspace(
+    first,
+    { kind: "unchanged", active: first.summary },
+  );
+  const titles: string[] = [];
+  const adapter = installPiWorkspaceAdapter({
+    pi: fakePi().api,
+    workspace: () => current,
+    enabled: () => true,
+    localBash: fakeBash(),
+    root: "/tmp/termia",
+  });
+
+  adapter.show(fakeCommandContext(titles));
+  current = fakeWorkspace(
+    second,
+    { kind: "unchanged", active: second.summary },
+  );
+  adapter.show(fakeCommandContext(titles));
+
+  assert.deepEqual(titles, ["Termia — file:///work/first", "Termia — file:///work/reset"]);
+});
+
 test("blocks Pi Bash with an actionable unavailable Active Workspace reason", async () => {
   const access = fakeAccess("ssh://klein@server/srv/app");
   const unavailable: WorkspaceAccess = {

@@ -46,6 +46,7 @@ import {
   isTermiaPty,
   TerminalController,
 } from "./terminal.ts";
+import { runTerminalReset } from "./terminal-reset.ts";
 
 type WorkspaceRuntime = {
   workspace: ActiveWorkspace;
@@ -414,6 +415,25 @@ export default function termia(pi: ExtensionAPI): void {
       }
       if (isTermiaPty()) {
         ctx.ui.notify("Already inside a Termia PTY; nested Termia is disabled", "warning");
+        return;
+      }
+      if (args.trim() === "reset") {
+        try {
+          const reset = await runTerminalReset({
+            ctx,
+            localCwd: state.workspaceRuntime.terminalFeed.localCwd(),
+            current: state.workspaceRuntime,
+            root: ROOT,
+            createStaging: (cwd) =>
+              createWorkspaceRuntime(cwd, state.history, state.localBash),
+            replace: (staged) => {
+              state.workspaceRuntime = staged;
+            },
+          });
+          if (reset.kind === "committed") state.piWorkspace?.show(reset.context);
+        } catch (error) {
+          ctx.ui.notify(`Termia terminal reset failed: ${errorMessage(error)}`, "error");
+        }
         return;
       }
       let invocation: TermiaInvocation;

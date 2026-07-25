@@ -106,6 +106,66 @@ test("publishes shell workspace facts through TerminalWorkspaceFeed", async (t) 
   assert.equal(facets.workspace.current().summary.uri, pathToFileURL(cwd).href);
 });
 
+test("stages a shell without competing for the active HistoryStore", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-stage-"));
+  const cwd = join(root, "cwd");
+  mkdirSync(cwd);
+  const history = new HistoryStore(join(root, "state"));
+  const currentFacets = createActiveWorkspace(cwd, {
+    run: async () => ({ exitCode: 0 }),
+  });
+  const stagedFacets = createActiveWorkspace(cwd, {
+    run: async () => ({ exitCode: 0 }),
+  });
+  const current = new TerminalController(history, currentFacets.terminal);
+  const staged = new TerminalController(history, stagedFacets.terminal);
+  t.after(async () => {
+    current.dispose();
+    staged.dispose();
+    await currentFacets.workspace[Symbol.asyncDispose]();
+    await stagedFacets.workspace[Symbol.asyncDispose]();
+    history.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  current.start(cwd, "/bin/bash");
+  await current.execute("true");
+  await staged.stage(cwd, "/bin/bash");
+
+  assert.equal(staged.running, true);
+  assert.throws(() => staged.write("pwd\r"), /staged terminal is not committed/);
+  await assert.rejects(staged.execute("pwd"), /staged terminal is not committed/);
+  assert.throws(() => staged.commitStaged(), /already active/);
+
+  current.dispose();
+  staged.commitStaged();
+  const record = await staged.execute("printf reset-ready");
+  assert.equal(record.exitCode, 0);
+  assert.match(history.readOutput(record), /reset-ready/);
+});
+
+test("rejects staging when the candidate shell exits before ready", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-stage-exit-"));
+  const cwd = join(root, "cwd");
+  const shell = join(root, "bash");
+  mkdirSync(cwd);
+  writeFileSync(shell, "#!/bin/sh\nexit 12\n");
+  chmodSync(shell, 0o700);
+  const history = new HistoryStore(join(root, "state"));
+  const controller = createTestTerminal(history);
+  t.after(() => {
+    controller.dispose();
+    history.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    controller.stage(cwd, shell),
+    /staged terminal exited before shell ready/,
+  );
+  assert.equal(controller.running, false);
+});
+
 test("uses and removes a private runtime hook directory", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "termia-terminal-runtime-"));
   const cwd = join(root, "cwd");

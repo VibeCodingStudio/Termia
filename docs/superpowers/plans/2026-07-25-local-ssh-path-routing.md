@@ -30,7 +30,7 @@
 - Consumes: `WorkspaceBinding`, a file-tool path, and the active SSH health state.
 - Produces: A local physical path, an SSHFS physical path, or a precise routing error.
 
-- [ ] **Step 1: Replace the old projection expectations with failing routing tests**
+- [x] **Step 1: Replace the old projection expectations with failing routing tests**
 
 Update `test/workspace.test.ts` so the path test asserts:
 
@@ -55,7 +55,7 @@ test("routes local absolute and remote relative or SSH paths", () => {
     () => projectWorkspacePath(binding, "ssh://alice@10.0.0.10/etc/hosts"),
     /does not match active SSH workspace/,
   );
-  assert.throws(() => projectWorkspacePath(binding, "ssh://%/bad"), /Invalid SSH workspace URI/);
+  assert.throws(() => projectWorkspacePath(binding, "ssh://[bad"), /Invalid SSH workspace URI/);
   assert.throws(() => projectWorkspacePath(binding, "file:///etc/hosts"), /Unsupported workspace URI/);
   assert.throws(() => projectWorkspacePath(binding, "bad\0path"), /NUL/);
 });
@@ -99,7 +99,7 @@ test("allows local absolute paths when the SSH leaf is disconnected", () => {
 
 Keep disconnected remote, tilde, traversal, and all-tool coverage. Remove every synthetic leading-`@` assertion.
 
-- [ ] **Step 2: Run the focused tests and verify they fail**
+- [x] **Step 2: Run the focused tests and verify they fail**
 
 Run:
 
@@ -109,7 +109,7 @@ node --test test/workspace.test.ts test/workspace-tools.test.ts
 
 Expected: failures show that absolute paths are still projected, `ssh://` is not parsed, and disconnected local reads are still blocked.
 
-- [ ] **Step 3: Implement the minimal path router**
+- [x] **Step 3: Implement the minimal path router**
 
 In `extensions/termia/workspace.ts`:
 
@@ -125,7 +125,7 @@ In `extensions/termia/workspace.ts`:
 
 The implementation must use the existing `workspaceUri()` as the canonical active authority and Node's `URL`, `decodeURIComponent`, and path functions. Do not introduce a new routing class or dependency.
 
-- [ ] **Step 4: Run the focused tests and verify they pass**
+- [x] **Step 4: Run the focused tests and verify they pass**
 
 Run:
 
@@ -135,7 +135,7 @@ node --test test/workspace.test.ts test/workspace-tools.test.ts
 
 Expected: all focused tests pass.
 
-- [ ] **Step 5: Commit the path router**
+- [x] **Step 5: Commit the path router**
 
 ```bash
 git add extensions/termia/workspace.ts test/workspace.test.ts test/workspace-tools.test.ts

@@ -42,24 +42,57 @@ test("formats IPv6 SSH authorities", () => {
   assert.equal(workspaceUri(binding.target), "ssh://alice@[2001:db8::1]/work");
 });
 
-test("projects absolute remote paths and @file paths without escaping the mount", () => {
+test("routes local absolute and remote relative or SSH paths", () => {
   const binding = sshWorkspace(hops, "/srv/app", "/tmp/mount-b");
-  assert.equal(projectWorkspacePath(binding, "/etc/hosts"), "/tmp/mount-b/etc/hosts");
-  assert.equal(projectWorkspacePath(binding, "@/etc/hosts"), "/tmp/mount-b/etc/hosts");
-  assert.equal(projectWorkspacePath(binding, "/../../etc/hosts"), "/tmp/mount-b/etc/hosts");
+  assert.equal(projectWorkspacePath(binding, "/etc/hosts"), "/etc/hosts");
   assert.equal(projectWorkspacePath(binding, "src/index.ts"), "src/index.ts");
-  assert.equal(projectWorkspacePath(binding, "@src/index.ts"), "@src/index.ts");
+  assert.equal(
+    projectWorkspacePath(binding, "ssh://bob@10.0.0.20:2222/etc/hosts"),
+    "/tmp/mount-b/etc/hosts",
+  );
+  assert.equal(
+    projectWorkspacePath(binding, "ssh://bob@10.0.0.20:2222/srv/a%20b.txt"),
+    "/tmp/mount-b/srv/a b.txt",
+  );
   assert.equal(
     projectWorkspacePath(binding, "../../../../etc/hosts"),
     "/tmp/mount-b/etc/hosts",
   );
-  assert.throws(() => projectWorkspacePath(binding, "/bad\0path"), /NUL/);
+  assert.equal(
+    projectWorkspacePath(binding, "/tmp/mount-b/srv/app/index.ts"),
+    "/tmp/mount-b/srv/app/index.ts",
+  );
+  assert.throws(
+    () => projectWorkspacePath(binding, "ssh://alice@10.0.0.10/etc/hosts"),
+    /does not match active SSH workspace/,
+  );
+  assert.throws(
+    () => projectWorkspacePath(binding, "ssh://[bad"),
+    /Invalid SSH workspace URI/,
+  );
+  assert.throws(
+    () => projectWorkspacePath(binding, "file:///etc/hosts"),
+    /Unsupported workspace URI/,
+  );
+  assert.throws(
+    () => projectWorkspacePath(binding, "ssh://bob:secret@10.0.0.20:2222/etc/hosts"),
+    /must not contain a password/,
+  );
+  assert.throws(
+    () => projectWorkspacePath(binding, "ssh://bob@10.0.0.20:2222/etc/hosts?raw=1"),
+    /must not contain a query or fragment/,
+  );
+  assert.throws(() => projectWorkspacePath(binding, "bad\0path"), /NUL/);
 });
 
 test("leaves local bindings unchanged", () => {
   const binding = fileWorkspace("/work/project");
   assert.equal(workspaceUri(binding.target), "file:///work/project");
   assert.equal(projectWorkspacePath(binding, "/etc/hosts"), "/etc/hosts");
+  assert.throws(
+    () => projectWorkspacePath(binding, "ssh://bob@10.0.0.20/etc/hosts"),
+    /no active SSH workspace/,
+  );
 });
 
 test("presents Pi's physical SSH cwd as the logical workspace", () => {

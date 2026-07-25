@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyWorkspaceToolPolicy, type WorkspaceBinding } from "../extensions/termia/workspace.ts";
+import {
+  applyWorkspaceToolPolicy,
+  fileWorkspace,
+  type WorkspaceBinding,
+} from "../extensions/termia/workspace.ts";
 
 const remoteBinding: WorkspaceBinding = {
   target: {
@@ -24,33 +28,42 @@ function toolEvent(toolName: string, input: Record<string, unknown>) {
   return { type: "tool_call" as const, toolCallId: "call-1", toolName, input };
 }
 
-test("projects every built-in file tool path into the leaf mount", () => {
+test("keeps local absolute file-tool paths on the host", () => {
   for (const toolName of ["read", "edit", "write", "grep", "find", "ls"] as const) {
-    const event = toolEvent(toolName, { path: "/etc/hosts" });
+    const event = toolEvent(toolName, {
+      path: "/home/klein/.pi/agent/skills/demo/SKILL.md",
+    });
     assert.deepEqual(applyWorkspaceToolPolicy(event, remoteBinding, true), { block: false });
-    assert.equal(event.input.path, "/tmp/mount-b/etc/hosts");
+    assert.equal(event.input.path, "/home/klein/.pi/agent/skills/demo/SKILL.md");
   }
 });
 
-test("keeps relative paths on the remote session cwd and projects absolute @files", () => {
+test("routes relative and explicit SSH file-tool paths to the leaf", () => {
   const relative = toolEvent("read", { path: "src/index.ts" });
-  const absoluteAt = toolEvent("read", { path: "@/etc/hosts" });
+  const absolute = toolEvent("read", { path: "ssh://bob@host-b/etc/hosts" });
   applyWorkspaceToolPolicy(relative, remoteBinding, true);
-  applyWorkspaceToolPolicy(absoluteAt, remoteBinding, true);
+  applyWorkspaceToolPolicy(absolute, remoteBinding, true);
   assert.equal(relative.input.path, "src/index.ts");
-  assert.equal(absoluteAt.input.path, "/tmp/mount-b/etc/hosts");
+  assert.equal(absolute.input.path, "/tmp/mount-b/etc/hosts");
 });
 
 test("blocks all workspace tools when the leaf is unhealthy", () => {
   for (const toolName of ["read", "edit", "write", "grep", "find", "ls", "bash"] as const) {
+    const input = toolName === "bash" ? {} : { path: "src/index.ts" };
     assert.deepEqual(
-      applyWorkspaceToolPolicy(toolEvent(toolName, {}), remoteBinding, false),
+      applyWorkspaceToolPolicy(toolEvent(toolName, input), remoteBinding, false),
       {
         block: true,
         reason: "Termia SSH workspace is disconnected; run /termia to return to the nearest live workspace",
       },
     );
   }
+});
+
+test("allows local absolute paths when the SSH leaf is disconnected", () => {
+  const local = toolEvent("read", { path: "/home/klein/file" });
+  assert.deepEqual(applyWorkspaceToolPolicy(local, remoteBinding, false), { block: false });
+  assert.equal(local.input.path, "/home/klein/file");
 });
 
 test("blocks remote tilde paths instead of expanding the local home directory", () => {
@@ -61,4 +74,12 @@ test("blocks remote tilde paths instead of expanding the local home directory", 
       reason: "Termia cannot map ~ paths safely; use an absolute remote path",
     },
   );
+});
+
+test("keeps Pi's native tilde handling outside SSH", () => {
+  const local = toolEvent("read", { path: "~/.ssh/config" });
+  assert.deepEqual(applyWorkspaceToolPolicy(local, fileWorkspace("/work/project"), true), {
+    block: false,
+  });
+  assert.equal(local.input.path, "~/.ssh/config");
 });

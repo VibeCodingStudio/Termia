@@ -147,7 +147,8 @@ ssh() {
     return $?
   }
 
-  command tar -C "$TERMIA_HOOK_DIR" -cf - termia.ash termia.bash termia.zsh termia-ssh.sh \
+  command tar -C "$TERMIA_HOOK_DIR" -cf - \
+    termia.ash termia.bash termia.zsh termia-ssh.sh termia-identity.sh identity.pub \
     | command ssh -S "$control_path" "$@" \
       "umask 077; tar -C $(__termia_shell_quote "$remote_dir") -xf -" || {
         __termia_ssh_unmanaged_master "$control_path" "$destination" "$remote_dir" "$@"
@@ -179,13 +180,13 @@ ssh() {
   fi
   case "$shell_name" in
     ash)
-      launch="TERMIA_PTY=1 TERMIA_SHELL_ID=$(__termia_shell_quote "$child_shell_id") TERMIA_HOOK_DIR=$(__termia_shell_quote "$remote_dir") TERMIA_ASH_LOGIN=1 ENV=$(__termia_shell_quote "$remote_dir/termia.ash") exec $(__termia_shell_quote "$remote_shell") -i"
+      launch="TERMIA_PTY=1 TERMIA_SSH_WORKSPACE=1 TERMIA_SHELL_ID=$(__termia_shell_quote "$child_shell_id") TERMIA_HOOK_DIR=$(__termia_shell_quote "$remote_dir") TERMIA_ASH_LOGIN=1 ENV=$(__termia_shell_quote "$remote_dir/termia.ash") exec $(__termia_shell_quote "$remote_shell") -i"
       ;;
     bash)
-      launch="TERMIA_PTY=1 TERMIA_SHELL_ID=$(__termia_shell_quote "$child_shell_id") TERMIA_HOOK_DIR=$(__termia_shell_quote "$remote_dir") exec $(__termia_shell_quote "$remote_shell") --noprofile --rcfile $(__termia_shell_quote "$remote_dir/bashrc") -i"
+      launch="TERMIA_PTY=1 TERMIA_SSH_WORKSPACE=1 TERMIA_SHELL_ID=$(__termia_shell_quote "$child_shell_id") TERMIA_HOOK_DIR=$(__termia_shell_quote "$remote_dir") exec $(__termia_shell_quote "$remote_shell") --noprofile --rcfile $(__termia_shell_quote "$remote_dir/bashrc") -i"
       ;;
     zsh)
-      launch="TERMIA_PTY=1 TERMIA_SHELL_ID=$(__termia_shell_quote "$child_shell_id") TERMIA_HOOK_DIR=$(__termia_shell_quote "$remote_dir") ZDOTDIR=$(__termia_shell_quote "$remote_dir") exec $(__termia_shell_quote "$remote_shell") -i"
+      launch="TERMIA_PTY=1 TERMIA_SSH_WORKSPACE=1 TERMIA_SHELL_ID=$(__termia_shell_quote "$child_shell_id") TERMIA_HOOK_DIR=$(__termia_shell_quote "$remote_dir") ZDOTDIR=$(__termia_shell_quote "$remote_dir") exec $(__termia_shell_quote "$remote_shell") -i"
       ;;
     *)
       __termia_ssh_unmanaged_master "$control_path" "$destination" "$remote_dir" "$@"

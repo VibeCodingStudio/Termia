@@ -11,6 +11,7 @@ __termia_b64() {
 }
 
 source "$TERMIA_HOOK_DIR/termia-ssh.sh"
+source "$TERMIA_HOOK_DIR/termia-identity.sh"
 
 __termia_ready() {
   local cwd shell_id

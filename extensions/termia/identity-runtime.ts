@@ -10,7 +10,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const ASSETS = ["termia.ash", "termia.bash", "termia.zsh", "termia-ssh.sh"];
+const ASSETS = [
+  "termia.ash",
+  "termia.bash",
+  "termia.zsh",
+  "termia-ssh.sh",
+  "termia-identity.sh",
+];
 
 export type IdentityRuntime = {
   hookDirectory: string;

@@ -34,6 +34,7 @@ __termia_unb64() {
 }
 
 . "$TERMIA_HOOK_DIR/termia-ssh.sh"
+. "$TERMIA_HOOK_DIR/termia-identity.sh"
 
 __termia_ready() {
   local __termia_cwd __termia_shell_id

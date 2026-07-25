@@ -14,7 +14,13 @@ import { join } from "node:path";
 import test from "node:test";
 import { createIdentityRuntime } from "../extensions/termia/identity-runtime.ts";
 
-const assets = ["termia.ash", "termia.bash", "termia.zsh", "termia-ssh.sh"];
+const assets = [
+  "termia.ash",
+  "termia.bash",
+  "termia.zsh",
+  "termia-ssh.sh",
+  "termia-identity.sh",
+];
 
 function sourceFixture(root: string): string {
   const source = join(root, "source");

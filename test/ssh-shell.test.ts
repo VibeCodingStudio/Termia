@@ -165,6 +165,33 @@ test("opens and closes a managed interactive SSH hop", async (t) => {
   assert.equal(invocations.flat().some((value) => /IdentityFile|private.key|reconnect/.test(value)), false);
 });
 
+test("copies identity assets to managed SSH shells", async (t) => {
+  const { bin, log } = fixture(t);
+  const tarLog = join(dirname(log), "tar.log");
+  const tar = join(bin, "tar");
+  writeFileSync(tar, `#!/bin/sh
+printf '%s\n' "$@" > "$TERMIA_TAR_TEST_LOG"
+`);
+  chmodSync(tar, 0o700);
+  const command = [
+    "__termia_b64() { command base64 | command tr -d '\\n'; }",
+    `source ${quote(join(shellDirectory, "termia-ssh.sh"))}`,
+    "ssh host-a",
+  ].join("\n");
+  await runShell(command, {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    TERMIA_PTY: "1",
+    TERMIA_SHELL_ID: "local",
+    TERMIA_HOOK_DIR: shellDirectory,
+    TERMIA_SSH_TEST_LOG: log,
+    TERMIA_TAR_TEST_LOG: tarLog,
+  });
+  const assets = readFileSync(tarLog, "utf8").split("\n");
+  assert.ok(assets.includes("termia-identity.sh"));
+  assert.ok(assets.includes("identity.pub"));
+});
+
 test("preserves managed SSH status in zsh", { skip: zsh === undefined }, async (t) => {
   const { bin, log } = fixture(t);
   const command = [

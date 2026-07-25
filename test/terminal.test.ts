@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import type { IPty } from "node-pty";
 import { createActiveWorkspace } from "../extensions/termia/active-workspace.ts";
@@ -71,6 +71,55 @@ function createTestTerminal(history: HistoryStore): TerminalController {
     run: async () => ({ exitCode: 0 }),
   });
   return new TerminalController(history, terminal);
+}
+
+function installFakeTerminalStdio(t: TestContext): string[] {
+  const stdinDescriptors = {
+    isTTY: Object.getOwnPropertyDescriptor(process.stdin, "isTTY"),
+    isRaw: Object.getOwnPropertyDescriptor(process.stdin, "isRaw"),
+    setRawMode: Object.getOwnPropertyDescriptor(process.stdin, "setRawMode"),
+  };
+  const stdoutDescriptors = {
+    isTTY: Object.getOwnPropertyDescriptor(process.stdout, "isTTY"),
+    write: Object.getOwnPropertyDescriptor(process.stdout, "write"),
+  };
+  const stdoutWrite = process.stdout.write.bind(process.stdout);
+  const restore = (target: object, key: string, descriptor: PropertyDescriptor | undefined) => {
+    if (descriptor === undefined) Reflect.deleteProperty(target, key);
+    else Object.defineProperty(target, key, descriptor);
+  };
+  const stdoutWrites: string[] = [];
+
+  Object.defineProperties(process.stdin, {
+    isTTY: { configurable: true, value: true },
+    isRaw: { configurable: true, writable: true, value: false },
+    setRawMode: {
+      configurable: true,
+      value: (raw: boolean) => Reflect.set(process.stdin, "isRaw", raw),
+    },
+  });
+  Object.defineProperties(process.stdout, {
+    isTTY: { configurable: true, value: true },
+    write: {
+      configurable: true,
+      value: (...args: Parameters<typeof process.stdout.write>) => {
+        const [chunk] = args;
+        stdoutWrites.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+        if (typeof chunk === "string") return true;
+        return stdoutWrite(...args);
+      },
+    },
+  });
+
+  t.after(() => {
+    process.stdin.pause();
+    restore(process.stdin, "isTTY", stdinDescriptors.isTTY);
+    restore(process.stdin, "isRaw", stdinDescriptors.isRaw);
+    restore(process.stdin, "setRawMode", stdinDescriptors.setRawMode);
+    restore(process.stdout, "isTTY", stdoutDescriptors.isTTY);
+    restore(process.stdout, "write", stdoutDescriptors.write);
+  });
+  return stdoutWrites;
 }
 
 test("detects only the Termia PTY marker", () => {
@@ -439,33 +488,16 @@ test("allows only one terminal attachment", async (t) => {
   const store = new HistoryStore(join(root, "state"));
   const controller = createTestTerminal(store);
   const writes = installFakePty(controller);
-  const stdinDescriptors = {
-    isTTY: Object.getOwnPropertyDescriptor(process.stdin, "isTTY"),
-    isRaw: Object.getOwnPropertyDescriptor(process.stdin, "isRaw"),
-    setRawMode: Object.getOwnPropertyDescriptor(process.stdin, "setRawMode"),
-  };
-  const stdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  const restore = (target: object, key: string, descriptor: PropertyDescriptor | undefined) => {
-    if (descriptor === undefined) Reflect.deleteProperty(target, key);
-    else Object.defineProperty(target, key, descriptor);
-  };
-  Object.defineProperties(process.stdin, {
-    isTTY: { configurable: true, value: true },
-    isRaw: { configurable: true, writable: true, value: false },
-    setRawMode: {
-      configurable: true,
-      value: (raw: boolean) => Reflect.set(process.stdin, "isRaw", raw),
-    },
-  });
-  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+  store.startTerminal({ id: "attach", shell: "/bin/bash", cwd: "/tmp" });
+  store.appendOutput(
+    `discarded:${"x".repeat(1024 * 1024)}\n`
+      + "[termia] /tmp $ echo kept\r\nkept\r\n[termia] /tmp $ ",
+  );
+  const offsetBeforeReplay = store.outputOffset;
+  const stdoutWrites = installFakeTerminalStdio(t);
   t.after(() => {
     controller.dispose();
-    process.stdin.pause();
     store.close();
-    restore(process.stdin, "isTTY", stdinDescriptors.isTTY);
-    restore(process.stdin, "isRaw", stdinDescriptors.isRaw);
-    restore(process.stdin, "setRawMode", stdinDescriptors.setRawMode);
-    restore(process.stdout, "isTTY", stdoutIsTTY);
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -521,10 +553,59 @@ test("allows only one terminal attachment", async (t) => {
     process.stdin.emit("data", Buffer.from("password\r"));
     assert.equal(writes.length, beforeInput + 1);
     assert.equal(Buffer.from(writes.at(-1)!).toString(), "password\r");
+    assert.equal(stdoutWrites.includes("\u001b[2J\u001b[H\u001b[0m"), true);
+    assert.equal(
+      stdoutWrites.includes("[termia] /tmp $ echo kept\r\nkept\r\n[termia] /tmp $ "),
+      true,
+    );
+    assert.equal(stdoutWrites.some((data) => data.includes("discarded:")), false);
+    assert.equal(store.outputOffset, offsetBeforeReplay);
+    assert.equal(writes.includes("\u000c"), false);
   } finally {
     process.stdin.emit("data", Buffer.from([0x1d]));
     await Promise.allSettled([first, second]);
   }
   assert.equal(process.stdin.listenerCount("data"), baselineListeners);
   assert.equal(starts, 1);
+});
+
+test("keeps PTY attachment usable when history replay fails", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-terminal-replay-error-"));
+  const store = new HistoryStore(join(root, "state"));
+  store.startTerminal({ id: "replay-error", shell: "/bin/bash", cwd: "/tmp" });
+  store.readActiveOutputTail = () => {
+    throw new Error("transcript unavailable");
+  };
+  const controller = createTestTerminal(store);
+  installFakePty(controller);
+  const stdoutWrites = installFakeTerminalStdio(t);
+  t.after(() => {
+    controller.dispose();
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const tui = {
+    start: () => {},
+    stop: () => {},
+    requestRender: () => {},
+    terminal: { drainInput: async () => {} },
+  };
+  const ctx = {
+    ui: {
+      custom: (factory: (...args: unknown[]) => unknown) => new Promise((resolve) => {
+        factory(tui, undefined, undefined, resolve);
+      }),
+    },
+  } as unknown as Parameters<TerminalController["enter"]>[0];
+
+  const attachment = controller.enter(ctx);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(
+    stdoutWrites.join(""),
+    /\[termia\] Unable to replay PTY history: transcript unavailable/,
+  );
+
+  process.stdin.emit("data", Buffer.from([0x1d]));
+  assert.deepEqual(await attachment, { type: "detach", shellId: "local" });
 });

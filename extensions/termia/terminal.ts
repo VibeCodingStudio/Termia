@@ -41,6 +41,7 @@ type StagedTerminal = {
 
 const SHELL_DIRECTORY = resolve(dirname(fileURLToPath(import.meta.url)), "./shell");
 const EXPLICIT_EXEC_CHUNK_SIZE = 256;
+const PTY_HISTORY_REPLAY_BYTES = 1024 * 1024;
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
@@ -267,6 +268,17 @@ export class TerminalController {
     return () => this.listeners.delete(listener);
   }
 
+  private replayHistory(): void {
+    process.stdout.write("\u001b[2J\u001b[H\u001b[0m");
+    try {
+      const replay = this.history.readActiveOutputTail(PTY_HISTORY_REPLAY_BYTES);
+      if (replay.length > 0) process.stdout.write(replay);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stdout.write(`\r\n[termia] Unable to replay PTY history: ${message}\r\n`);
+    }
+  }
+
   async enter(ctx: TerminalContext): Promise<TerminalAttachExit> {
     this.assertCommitted();
     if (this.pty === undefined) {
@@ -319,14 +331,13 @@ export class TerminalController {
 
         try {
           tui.stop();
-          process.stdout.write("\u001b[2J\u001b[H");
+          this.replayHistory();
           process.stdin.setRawMode(true);
           process.stdin.on("data", onInput);
           process.stdin.resume();
           process.on("SIGWINCH", onResize);
           this.detach = finish;
           onResize();
-          this.pty?.write("\u000c");
         } catch (error) {
           finish();
           throw error;

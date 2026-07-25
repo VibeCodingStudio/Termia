@@ -34,6 +34,7 @@ function fixture(t: TestContext, enabled = true): { bin: string; hooks: string; 
   for (const name of ["termia.ash", "termia.bash", "termia.zsh"]) {
     writeFileSync(join(hooks, name), ":\n");
   }
+  writeFileSync(join(hooks, "termia-ssh.sh"), ":\n");
   writeFileSync(join(hooks, "identity.pub"), enabled ? "ssh-ed25519 AAAA test\n" : "");
   for (const command of ["sudo", "su"]) {
     const path = join(bin, command);
@@ -170,6 +171,30 @@ test("passes user switches through when identity credentials are unavailable", a
     { command: "sudo", argv: ["-i"] },
     { command: "su", argv: ["-"] },
   ]);
+});
+
+test("stages the nested SSH hook for a switched shell", async (t) => {
+  const { bin, hooks } = fixture(t);
+  writeFileSync(join(bin, "sudo"), `#!/bin/sh
+stage=
+for value do
+  case "$value" in */termia-identity.sh) stage=$(dirname "$value") ;; esac
+done
+[ -r "$stage/termia-ssh.sh" ] || exit 91
+exit 0
+`);
+  chmodSync(join(bin, "sudo"), 0o700);
+
+  const exitCode = await runShell(`source ${quote(identityScript)}\nsudo -i`, {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    TERMIA_PTY: "1",
+    TERMIA_SSH_WORKSPACE: "1",
+    TERMIA_SHELL_ID: "shell-a",
+    TERMIA_HOOK_DIR: hooks,
+  });
+
+  assert.equal(exitCode, 0);
 });
 
 test("installs the identity wrapper from the bash hook", async () => {

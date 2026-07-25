@@ -70,6 +70,7 @@ __termia_identity_stage() {
     "$TERMIA_HOOK_DIR/termia.ash" \
     "$TERMIA_HOOK_DIR/termia.bash" \
     "$TERMIA_HOOK_DIR/termia.zsh" \
+    "$TERMIA_HOOK_DIR/termia-ssh.sh" \
     "$TERMIA_HOOK_DIR/termia-identity.sh" \
     "$TERMIA_HOOK_DIR/identity.pub" \
     "$stage/" || {
@@ -77,7 +78,7 @@ __termia_identity_stage() {
       return 1
     }
   command chmod 644 "$stage/termia.ash" "$stage/termia.bash" \
-    "$stage/termia.zsh" "$stage/identity.pub"
+    "$stage/termia.zsh" "$stage/termia-ssh.sh" "$stage/identity.pub"
   command chmod 755 "$stage/termia-identity.sh"
   printf '%s' "$stage"
 }

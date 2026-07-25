@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -25,7 +25,12 @@ import {
 class MemoryMounts implements MountOperations {
   private readonly healthy = new Map<string, boolean>();
   private readonly failures = new Map<string, string>();
+  private readonly mountRoot: string;
   disposeCount = 0;
+
+  constructor(mountRoot = "/tmp/termia-test-mount") {
+    this.mountRoot = mountRoot;
+  }
 
   failMount(shellId: string, reason: string): void {
     this.failures.set(shellId, reason);
@@ -41,7 +46,7 @@ class MemoryMounts implements MountOperations {
     const failure = this.failures.get(shellId);
     if (failure !== undefined) throw new Error(failure);
     this.healthy.set(shellId, true);
-    return sshWorkspace(hops, cwd, "/tmp/termia-test-mount");
+    return sshWorkspace(hops, cwd, this.mountRoot);
   }
 
   updateCwd(binding: WorkspaceBinding, cwd: string): WorkspaceBinding {
@@ -669,6 +674,70 @@ test("blocks remote files but permits local absolute files while Active is unava
       options: { onData: () => {} },
     }),
     WorkspaceUnavailableError,
+  );
+});
+
+test("blocks a symlink alias into an unavailable remote mount", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-mount-alias-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const mountRoot = join(root, "mount");
+  const localRoot = join(root, "local");
+  const alias = join(root, "mount-alias");
+  mkdirSync(mountRoot);
+  mkdirSync(localRoot);
+  symlinkSync(mountRoot, alias, "dir");
+  const mounts = new MemoryMounts(mountRoot);
+  const { workspace, terminal } = createActiveWorkspace(
+    localRoot,
+    fakeDetached(),
+    mounts,
+    new MemoryIdentities(),
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot(localRoot, "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: join(root, "control"),
+    cwd: "/srv/app",
+  });
+  const activation = await workspace.prepare("remote");
+  assert.equal(activation.kind, "ready");
+  activation.commit();
+  mounts.setHealthy("remote", false);
+  const unavailable = workspace.current();
+
+  assert.equal(unavailable.filePath(join(localRoot, "notes.txt")), join(localRoot, "notes.txt"));
+  assert.throws(
+    () => unavailable.filePath(join(alias, "srv/app/secret.txt")),
+    WorkspaceUnavailableError,
+  );
+});
+
+test("fails every Active Workspace capability closed after desynchronization", async (t) => {
+  const { workspace } = createActiveWorkspace("/work/project", fakeDetached());
+  t.after(() => workspace[Symbol.asyncDispose]());
+  const previous = workspace.current();
+
+  workspace.failClosed("Pi session rollback was cancelled");
+  const failed = workspace.current();
+
+  assert.equal(failed.summary.availability.kind, "desynchronized");
+  assert.throws(() => previous.executionDirectory(), StaleWorkspaceAccessError);
+  assert.throws(() => failed.executionDirectory(), /rollback was cancelled/);
+  assert.throws(() => failed.filePath("/etc/hosts"), /rollback was cancelled/);
+  assert.throws(
+    () => failed.present({ systemPrompt: "base", skills: [] }),
+    /rollback was cancelled/,
+  );
+  await assert.rejects(
+    workspace.prepare("local"),
+    /rollback was cancelled/,
   );
 });
 

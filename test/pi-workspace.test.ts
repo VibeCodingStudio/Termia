@@ -14,6 +14,7 @@ import type {
 } from "../extensions/termia/active-workspace.ts";
 import { StaleActivationError } from "../extensions/termia/active-workspace.ts";
 import { installPiWorkspaceAdapter } from "../extensions/termia/pi-workspace.ts";
+import { SessionRollbackError } from "../extensions/termia/session.ts";
 
 function summary(uri: string): WorkspaceSummary {
   return {
@@ -44,6 +45,7 @@ function fakeWorkspace(
   return {
     current: () => access,
     prepare: async () => activation,
+    failClosed: () => {},
     [Symbol.asyncDispose]: async () => {},
   };
 }
@@ -298,6 +300,63 @@ test("defers when a handoff callback throws before commit", async () => {
   assert.equal(deferredReason, "replacement initialization failed");
 });
 
+test("fails closed when replacement initialization and automatic rollback both fail", async () => {
+  const active = summary("file:///work/project");
+  const pending = {
+    uri: "ssh://klein@server/srv/app",
+    generation: 2 as WorkspaceSummary["generation"],
+    active,
+    readiness: "ready" as const,
+  };
+  let failure: string | undefined;
+  const access = (): WorkspaceAccess => ({
+    ...fakeAccess(),
+    summary: {
+      ...active,
+      availability: failure === undefined
+        ? { kind: "available" }
+        : { kind: "desynchronized", reason: failure },
+    },
+  });
+  const workspace: ActiveWorkspace = {
+    current: access,
+    prepare: async () => ({
+      kind: "ready",
+      pending,
+      handoffCwd: "/physical/srv/app",
+      commit: () => { throw new Error("must not commit"); },
+      defer: (reason) => ({ ...pending, readiness: "deferred", reason }),
+    }),
+    failClosed: (reason) => { failure = reason; },
+    [Symbol.asyncDispose]: async () => {},
+  };
+  const titles: string[] = [];
+  const notifications: Array<{ message: string; type: string | undefined }> = [];
+  const replacementCtx = fakeCommandContext(titles, notifications);
+  const adapter = installPiWorkspaceAdapter({
+    pi: fakePi().api,
+    workspace: () => workspace,
+    enabled: () => true,
+    localBash: fakeBash(),
+    root: "/tmp/termia",
+    handoff: async (_ctx, _cwd, _root, options) => {
+      await options?.withSession?.(replacementCtx);
+      throw new SessionRollbackError(
+        [new Error("initialization failed"), new Error("rollback hook failed")],
+        "Termia session handoff failed and rollback was unsuccessful",
+      );
+    },
+  });
+
+  assert.equal(await adapter.activate(fakeCommandContext(), "remote"), "desynchronized");
+  assert.equal(failure, "Termia session handoff failed and rollback was unsuccessful");
+  assert.deepEqual(titles, ["Termia — file:///work/project · desynchronized"]);
+  assert.deepEqual(notifications, [{
+    message: "Termia Active Workspace is desynchronized: Termia session handoff failed and rollback was unsuccessful; Agent workspace tools are blocked until /termia reset",
+    type: "error",
+  }]);
+});
+
 test("rolls the Pi session back when topology invalidates the activation after handoff", async () => {
   const order: string[] = [];
   const active = summary("file:///work/project");
@@ -308,8 +367,9 @@ test("rolls the Pi session back when topology invalidates the activation after h
     readiness: "ready" as const,
   };
   let topologyChanged = false;
+  const titles: string[] = [];
   const notifications: Array<{ message: string; type: string | undefined }> = [];
-  const restoredContext = fakeCommandContext([], notifications);
+  const restoredContext = fakeCommandContext(titles, notifications);
   const activation: WorkspaceActivation = {
     kind: "ready",
     pending,
@@ -340,7 +400,10 @@ test("rolls the Pi session back when topology invalidates the activation after h
         commit: () => order.push("commit-session"),
         rollback: async () => {
           order.push("rollback-session");
-          return restoredContext;
+          return {
+            context: restoredContext,
+            cleanupError: new Error("replacement archive denied"),
+          };
         },
       };
     },
@@ -356,7 +419,138 @@ test("rolls the Pi session back when topology invalidates the activation after h
   assert.deepEqual(notifications, [{
     message: "Termia workspace handoff rolled back: topology changed; previous Active Workspace retained",
     type: "warning",
+  }, {
+    message: "Termia session cleanup failed after rollback: replacement archive denied",
+    type: "warning",
   }]);
+  assert.deepEqual(titles, ["Termia — file:///work/project"]);
+});
+
+test("keeps activation committed when source session archival fails", async () => {
+  const active = summary("file:///work/project");
+  const pending = {
+    uri: "ssh://klein@server/srv/app",
+    generation: 2 as WorkspaceSummary["generation"],
+    active,
+    readiness: "ready" as const,
+  };
+  let committed = false;
+  const activation: WorkspaceActivation = {
+    kind: "ready",
+    pending,
+    handoffCwd: "/physical/srv/app",
+    commit: () => {
+      committed = true;
+      return { ...pending, availability: { kind: "available" } };
+    },
+    defer: () => ({ ...pending, readiness: "deferred" }),
+  };
+  const titles: string[] = [];
+  const notifications: Array<{ message: string; type: string | undefined }> = [];
+  const replacementCtx = fakeCommandContext(titles, notifications);
+  const remoteAccess = fakeAccess(pending.uri, "/physical/srv/app");
+  const adapter = installPiWorkspaceAdapter({
+    pi: fakePi().api,
+    workspace: () => fakeWorkspace(committed ? remoteAccess : fakeAccess(), activation),
+    enabled: () => true,
+    localBash: fakeBash(),
+    root: "/tmp/termia",
+    handoff: async (_ctx, _cwd, _root, options) => {
+      await options?.withSession?.(replacementCtx);
+      return {
+        cancelled: false,
+        switched: true,
+        commit: () => new Error("source archive denied"),
+        rollback: async () => ({ context: replacementCtx }),
+      };
+    },
+  });
+
+  assert.equal(await adapter.activate(fakeCommandContext(), "remote"), "committed");
+  assert.equal(committed, true);
+  assert.deepEqual(titles, ["Termia — ssh://klein@server/srv/app"]);
+  assert.deepEqual(notifications, [{
+    message: "Termia session cleanup failed after activation: source archive denied",
+    type: "warning",
+  }]);
+});
+
+test("fails Agent workspace tools closed when Pi session rollback fails", async () => {
+  const active = summary("file:///work/project");
+  const pending = {
+    uri: "ssh://klein@server/srv/app",
+    generation: 2 as WorkspaceSummary["generation"],
+    active,
+    readiness: "ready" as const,
+  };
+  const activation: WorkspaceActivation = {
+    kind: "ready",
+    pending,
+    handoffCwd: "/physical/srv/app",
+    commit: () => { throw new StaleActivationError("topology changed"); },
+    defer: (reason) => ({ ...pending, readiness: "deferred", reason }),
+  };
+  let failure: string | undefined;
+  const access = (): WorkspaceAccess => ({
+    ...fakeAccess(),
+    summary: {
+      ...active,
+      availability: failure === undefined
+        ? { kind: "available" }
+        : { kind: "desynchronized", reason: failure } as unknown as WorkspaceSummary["availability"],
+    },
+  });
+  const workspace: ActiveWorkspace = {
+    current: access,
+    prepare: async () => activation,
+    failClosed: (reason) => { failure = reason; },
+    [Symbol.asyncDispose]: async () => {},
+  };
+  const titles: string[] = [];
+  const notifications: Array<{ message: string; type: string | undefined }> = [];
+  const replacementCtx = fakeCommandContext(titles, notifications);
+  const pi = fakePi();
+  const adapter = installPiWorkspaceAdapter({
+    pi: pi.api,
+    workspace: () => workspace,
+    enabled: () => true,
+    localBash: fakeBash(),
+    root: "/tmp/termia",
+    handoff: async (_ctx, _cwd, _root, options) => {
+      await options?.withSession?.(replacementCtx);
+      return {
+        cancelled: false,
+        switched: true,
+        commit: () => undefined,
+        rollback: async () => { throw new Error("rollback cancelled"); },
+      };
+    },
+  });
+
+  assert.equal(
+    await adapter.activate(fakeCommandContext(), "remote"),
+    "desynchronized",
+  );
+  assert.match(failure ?? "", /rollback cancelled/);
+  assert.deepEqual(titles, ["Termia — file:///work/project · desynchronized"]);
+  assert.deepEqual(notifications, [{
+    message: "Termia Active Workspace is desynchronized: rollback cancelled; Agent workspace tools are blocked until /termia reset",
+    type: "error",
+  }]);
+
+  const decision = pi.handlers.get("tool_call")?.({
+    toolName: "read",
+    input: { path: "/etc/hosts" },
+  }, undefined) as { block: boolean; reason: string } | undefined;
+  assert.equal(decision?.block, true);
+  assert.match(decision?.reason ?? "", /desynchronized/);
+  assert.match(decision?.reason ?? "", /\/termia reset/);
+  const bashDecision = pi.handlers.get("tool_call")?.({
+    toolName: "bash",
+    input: { command: "pwd" },
+  }, undefined) as { block: boolean; reason: string } | undefined;
+  assert.equal(bashDecision?.block, true);
+  assert.match(bashDecision?.reason ?? "", /desynchronized/);
 });
 
 test("reports a blocked Pending Workspace without changing the title", async () => {

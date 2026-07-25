@@ -14,11 +14,15 @@ type HandoffContext = Pick<ExtensionCommandContext, "cwd" | "waitForIdle" | "swi
 export type SessionTransitionOptions = {
   withSession?: WithSession;
 };
+export class SessionRollbackError extends AggregateError {}
 export type PreparedSessionHandoff = {
   cancelled: boolean;
   switched: boolean;
-  commit(): void;
-  rollback(): Promise<ReplacedSessionContext | undefined>;
+  commit(): unknown | undefined;
+  rollback(): Promise<{
+    context?: ReplacedSessionContext;
+    cleanupError?: unknown;
+  }>;
 };
 
 function sessionDirectory(root: string): string {
@@ -62,6 +66,15 @@ export function isManagedSession(file: string, root: string): boolean {
 export function retireManagedSession(file: string, root: string): string | undefined {
   if (!isManagedSession(file, root) || !existsSync(file)) return undefined;
   return retireSessionFile(file, root);
+}
+
+function captureRetirementError(file: string, root: string): unknown | undefined {
+  try {
+    retireManagedSession(file, root);
+    return undefined;
+  } catch (error) {
+    return error;
+  }
 }
 
 function retireSessionFile(file: string, root: string): string {
@@ -119,15 +132,18 @@ export async function prepareSessionHandoff(
       rollback: async () => {
         if (settled) throw new Error("Termia session handoff is already settled");
         settled = true;
-        return undefined;
+        return {};
       },
     };
   }
 
   const replacementFile = forkManagedSession(sourceFile, targetCwd, root);
   let replacementContext: ReplacedSessionContext | undefined;
-  const rollbackSwitch = async (): Promise<ReplacedSessionContext | undefined> => {
-    if (replacementContext === undefined) return undefined;
+  const rollbackSwitch = async (): Promise<{
+    context?: ReplacedSessionContext;
+    cleanupError?: unknown;
+  }> => {
+    if (replacementContext === undefined) return {};
     let restoredContext: ReplacedSessionContext | undefined;
     const rollback = await replacementContext.switchSession(sourceFile, {
       withSession: async (nextContext) => {
@@ -137,8 +153,11 @@ export async function prepareSessionHandoff(
     if (rollback.cancelled) {
       throw new Error("Termia could not roll back the Pi session handoff");
     }
-    retireManagedSession(replacementFile, root);
-    return restoredContext;
+    const cleanupError = captureRetirementError(replacementFile, root);
+    return {
+      ...(restoredContext === undefined ? {} : { context: restoredContext }),
+      ...(cleanupError === undefined ? {} : { cleanupError }),
+    };
   };
 
   let result: { cancelled: boolean };
@@ -150,13 +169,24 @@ export async function prepareSessionHandoff(
       },
     });
   } catch (error) {
+    let cleanupError: unknown | undefined;
     try {
-      if (replacementContext === undefined) retireManagedSession(replacementFile, root);
-      else await rollbackSwitch();
+      if (replacementContext === undefined) {
+        cleanupError = captureRetirementError(replacementFile, root);
+      } else {
+        const rollback = await rollbackSwitch();
+        cleanupError = rollback.cleanupError;
+      }
     } catch (rollbackError) {
-      throw new AggregateError(
+      throw new SessionRollbackError(
         [error, rollbackError],
         "Termia session handoff failed and rollback was unsuccessful",
+      );
+    }
+    if (cleanupError !== undefined) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Termia session handoff failed, rollback succeeded, and replacement cleanup failed",
       );
     }
     throw error;
@@ -167,7 +197,7 @@ export async function prepareSessionHandoff(
       cancelled: true,
       switched: false,
       commit: () => {},
-      rollback: async () => undefined,
+      rollback: async () => ({}),
     };
   }
 
@@ -177,8 +207,8 @@ export async function prepareSessionHandoff(
     switched: true,
     commit: () => {
       if (settled) throw new Error("Termia session handoff is already settled");
-      retireManagedSession(sourceFile, root);
       settled = true;
+      return captureRetirementError(sourceFile, root);
     },
     rollback: async () => {
       if (settled) throw new Error("Termia session handoff is already settled");

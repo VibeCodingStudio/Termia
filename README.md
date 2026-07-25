@@ -104,6 +104,11 @@ Remote Agent file operations and Bash are blocked until it is recovered, while
 local absolute file reads remain possible. Closing the failed hop in the
 terminal is the normal recovery path.
 
+If a Pi session handoff succeeds but its compensating rollback cannot restore
+the previous session, Termia marks the Active Workspace as desynchronized and
+blocks all Agent workspace tools. This state never falls back silently; use
+`/termia reset` to replace the terminal and workspace runtime together.
+
 `/termia reset` is the explicit fallback. After confirmation, Termia stages a
 fresh local terminal and Pi session, swaps them in only after the handoff
 succeeds, and then discards the old terminal and SSH chain. A failure before the

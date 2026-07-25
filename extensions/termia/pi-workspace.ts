@@ -10,6 +10,7 @@ import {
 } from "./active-workspace.ts";
 import {
   prepareSessionHandoff,
+  SessionRollbackError,
   type SessionTransitionOptions,
 } from "./session.ts";
 
@@ -17,7 +18,8 @@ export type WorkspaceActivationResult =
   | "unchanged"
   | "committed"
   | "pending"
-  | "cancelled";
+  | "cancelled"
+  | "desynchronized";
 
 export interface PiWorkspaceAdapter {
   activate(
@@ -31,8 +33,11 @@ export interface PiWorkspaceAdapter {
 type WorkspaceHandoffResult = {
   cancelled: boolean;
   switched: boolean;
-  commit?(): void;
-  rollback?(): Promise<ExtensionCommandContext | undefined>;
+  commit?(): unknown | undefined;
+  rollback?(): Promise<{
+    context?: ExtensionCommandContext;
+    cleanupError?: unknown;
+  }>;
 };
 
 type WorkspaceHandoff = (
@@ -83,6 +88,15 @@ export function installPiWorkspaceAdapter(
   options.pi.on("tool_call", (event) => {
     if (!options.enabled()) return;
     const access = options.workspace().current();
+    if (
+      access.summary.availability.kind === "desynchronized"
+      && (FILE_TOOLS.has(event.toolName) || event.toolName === "bash")
+    ) {
+      return {
+        block: true,
+        reason: `Termia Active Workspace is desynchronized: ${access.summary.availability.reason}; Agent workspace tools are blocked until /termia reset`,
+      };
+    }
     if (FILE_TOOLS.has(event.toolName)) {
       const input = event.input as Record<string, unknown>;
       if (typeof input.path !== "string") return;
@@ -155,32 +169,63 @@ export function installPiWorkspaceAdapter(
         } catch (commitError) {
           if (result.rollback === undefined) throw commitError;
 
-          let restoredCtx: ExtensionCommandContext | undefined;
+          let rollback: {
+            context?: ExtensionCommandContext;
+            cleanupError?: unknown;
+          };
           try {
-            restoredCtx = await result.rollback();
+            rollback = await result.rollback();
           } catch (rollbackError) {
-            throw new AggregateError(
-              [commitError, rollbackError],
-              "Termia workspace activation failed and Pi session rollback was unsuccessful",
+            const reason = errorMessage(rollbackError);
+            options.workspace().failClosed(reason);
+            const failedCtx = replacementCtx ?? ctx;
+            failedCtx.ui.notify(
+              `Termia Active Workspace is desynchronized: ${reason}; Agent workspace tools are blocked until /termia reset`,
+              "error",
             );
+            adapter.show(failedCtx);
+            return "desynchronized";
           }
           try {
             prepared.defer(errorMessage(commitError));
           } catch (deferError) {
             if (!(deferError instanceof StaleActivationError)) throw deferError;
           }
-          const rollbackCtx = restoredCtx ?? replacementCtx ?? ctx;
+          const rollbackCtx = rollback.context ?? replacementCtx ?? ctx;
           rollbackCtx.ui.notify(
             `Termia workspace handoff rolled back: ${errorMessage(commitError)}; previous Active Workspace retained`,
             "warning",
           );
+          if (rollback.cleanupError !== undefined) {
+            rollbackCtx.ui.notify(
+              `Termia session cleanup failed after rollback: ${errorMessage(rollback.cleanupError)}`,
+              "warning",
+            );
+          }
           adapter.show(rollbackCtx);
           return "cancelled";
         }
-        result.commit?.();
+        const cleanupError = result.commit?.();
         adapter.show(replacementCtx ?? ctx);
+        if (cleanupError !== undefined) {
+          (replacementCtx ?? ctx).ui.notify(
+            `Termia session cleanup failed after activation: ${errorMessage(cleanupError)}`,
+            "warning",
+          );
+        }
         return "committed";
       } catch (error) {
+        if (!committed && error instanceof SessionRollbackError) {
+          const reason = errorMessage(error);
+          options.workspace().failClosed(reason);
+          const failedCtx = replacementCtx ?? ctx;
+          failedCtx.ui.notify(
+            `Termia Active Workspace is desynchronized: ${reason}; Agent workspace tools are blocked until /termia reset`,
+            "error",
+          );
+          adapter.show(failedCtx);
+          return "desynchronized";
+        }
         if (!committed) {
           try {
             prepared.defer(errorMessage(error));
@@ -197,7 +242,9 @@ export function installPiWorkspaceAdapter(
       ctx.ui.setTitle(
         summary.availability.kind === "available"
           ? `Termia — ${summary.uri}`
-          : `Termia — ${summary.uri} · unavailable`,
+          : summary.availability.kind === "desynchronized"
+            ? `Termia — ${summary.uri} · desynchronized`
+            : `Termia — ${summary.uri} · unavailable`,
       );
     },
   };

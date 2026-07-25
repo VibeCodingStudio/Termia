@@ -1,4 +1,5 @@
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type {
   IdentityOperations,
   MountOperations,
@@ -20,7 +21,8 @@ export type WorkspaceGeneration = number & {
 
 export type WorkspaceAvailability =
   | { kind: "available" }
-  | { kind: "unavailable"; reason: string };
+  | { kind: "unavailable"; reason: string }
+  | { kind: "desynchronized"; reason: string };
 
 export type WorkspaceSummary = {
   uri: string;
@@ -51,6 +53,7 @@ export type DetachedCommandResult = { exitCode: number | null };
 
 export class StaleActivationError extends Error {}
 export class StaleWorkspaceAccessError extends Error {}
+export class WorkspaceDesynchronizedError extends Error {}
 export class WorkspacePathError extends Error {}
 export class WorkspaceUnavailableError extends Error {}
 
@@ -85,6 +88,7 @@ export type WorkspaceActivation =
 export interface ActiveWorkspace extends AsyncDisposable {
   current(): WorkspaceAccess;
   prepare(shellId: string): Promise<WorkspaceActivation>;
+  failClosed(reason: string): void;
 }
 
 export interface TerminalWorkspaceFeed {
@@ -137,10 +141,12 @@ class ActiveWorkspaceState {
       summary: this.summary(binding),
       executionDirectory: () => {
         this.assertCurrent(generation);
+        this.assertSynchronized();
         return binding.piCwd;
       },
       filePath: (input) => {
         this.assertCurrent(generation);
+        this.assertSynchronized();
         try {
           if (binding.target.scheme === "ssh" && /^~(?:\/|$)/.test(input)) {
             throw new WorkspacePathError(
@@ -158,6 +164,7 @@ class ActiveWorkspaceState {
         } catch (error) {
           if (
             error instanceof WorkspacePathError
+            || error instanceof WorkspaceDesynchronizedError
             || error instanceof WorkspaceUnavailableError
           ) throw error;
           throw new WorkspacePathError(
@@ -168,6 +175,7 @@ class ActiveWorkspaceState {
       },
       runDetached: async (input) => {
         this.assertCurrent(generation);
+        this.assertSynchronized();
         if (resolve(input.cwd) !== resolve(binding.piCwd)) {
           throw new Error(
             `Termia command cwd is outside the Active Workspace: ${input.cwd}`,
@@ -193,6 +201,7 @@ class ActiveWorkspaceState {
       },
       present: (input) => {
         this.assertCurrent(generation);
+        this.assertSynchronized();
         return {
           ...input,
           systemPrompt: presentWorkspaceCwd(
@@ -207,6 +216,7 @@ class ActiveWorkspaceState {
 
   async prepare(shellId: string): Promise<WorkspaceActivation> {
     this.assertLive();
+    this.assertSynchronized();
     const ticketEpoch = ++this.activationEpoch;
     const preparedAt = this.topologyRevision;
     const active = this.current().summary;
@@ -335,6 +345,14 @@ class ActiveWorkspaceState {
     await this.finalDisposal;
   }
 
+  failClosed(reason: string): void {
+    this.assertLive();
+    this.availability = { kind: "desynchronized", reason };
+    this.topologyRevision += 1;
+    this.activationEpoch += 1;
+    this.generation += 1;
+  }
+
   private summary(binding: WorkspaceBinding): WorkspaceSummary {
     return {
       uri: workspaceUri(binding.target),
@@ -344,6 +362,7 @@ class ActiveWorkspaceState {
   }
 
   private refreshAvailability(): void {
+    if (this.availability.kind === "desynchronized") return;
     const next: WorkspaceAvailability = this.chain.isHealthy(this.active)
       ? { kind: "available" }
       : { kind: "unavailable", reason: "SSH route or mount health check failed" };
@@ -375,6 +394,14 @@ class ActiveWorkspaceState {
     return `Termia Active Workspace ${uri} is unavailable${detail}; close the failed SSH hop in the terminal or run /termia reset`;
   }
 
+  private assertSynchronized(): void {
+    if (this.availability.kind === "desynchronized") {
+      throw new WorkspaceDesynchronizedError(
+        `Termia Active Workspace is desynchronized: ${this.availability.reason}; Agent workspace tools are blocked until /termia reset`,
+      );
+    }
+  }
+
   private assertLive(): void {
     if (this.disposed) {
       throw new StaleWorkspaceAccessError("Termia Active Workspace has been disposed");
@@ -400,7 +427,36 @@ class ActiveWorkspaceState {
   private traversesRemoteMount(binding: WorkspaceBinding, input: string): boolean {
     if (!isAbsolute(input)) return true;
     if (binding.target.scheme !== "ssh" || binding.mountRoot === undefined) return false;
-    const location = relative(binding.mountRoot, resolve(input));
+    if (this.isWithin(binding.mountRoot, input)) return true;
+    try {
+      return this.isWithin(
+        this.canonicalLocation(binding.mountRoot),
+        this.canonicalLocation(input),
+      );
+    } catch {
+      return true;
+    }
+  }
+
+  private canonicalLocation(input: string): string {
+    let existing = resolve(input);
+    const missing: string[] = [];
+    while (true) {
+      try {
+        return resolve(realpathSync.native(existing), ...missing);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+        const parent = dirname(existing);
+        if (parent === existing) throw error;
+        missing.unshift(basename(existing));
+        existing = parent;
+      }
+    }
+  }
+
+  private isWithin(directory: string, input: string): boolean {
+    const location = relative(resolve(directory), resolve(input));
     return location === ""
       || (location !== ".." && !location.startsWith(`..${sep}`) && !isAbsolute(location));
   }
@@ -417,6 +473,7 @@ export function createActiveWorkspace(
     workspace: {
       current: () => state.current(),
       prepare: (shellId) => state.prepare(shellId),
+      failClosed: (reason) => state.failClosed(reason),
       [Symbol.asyncDispose]: () => state.dispose(),
     },
     terminal: {

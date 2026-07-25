@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -158,6 +159,7 @@ function transactionalContext(
   targetCwd: string,
   sourceFile: string,
   switched: string[],
+  rollbackBehavior: { cancelled?: boolean; error?: Error } = {},
 ): ExtensionCommandContext {
   type SwitchOptions = NonNullable<Parameters<ExtensionCommandContext["switchSession"]>[1]>;
   type ReplacedSessionContext = Parameters<NonNullable<SwitchOptions["withSession"]>>[0];
@@ -175,6 +177,8 @@ function transactionalContext(
     }) => {
       switched.push(file);
       assert.equal(file, sourceFile);
+      if (rollbackBehavior.error !== undefined) throw rollbackBehavior.error;
+      if (rollbackBehavior.cancelled === true) return { cancelled: true };
       await options?.withSession?.(restored);
       return { cancelled: false };
     },
@@ -239,7 +243,7 @@ test("rolls a prepared handoff back to the source session", async (t) => {
 
   const restored = await handoff.rollback();
 
-  assert.equal(restored?.cwd, sourceCwd);
+  assert.equal(restored.context?.cwd, sourceCwd);
   assert.deepEqual(switched, [replacementFile, sourceFile]);
   assert.equal(existsSync(sourceFile), true);
   assert.equal(existsSync(replacementFile), false);
@@ -271,6 +275,154 @@ test("automatically rolls back when replacement session initialization fails", a
   assert.deepEqual(switched, [replacementFile, sourceFile]);
   assert.equal(existsSync(sourceFile), true);
   assert.equal(existsSync(replacementFile), false);
+});
+
+test("reports cleanup separately when failed initialization was successfully rolled back", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-failed-cleanup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const switched: string[] = [];
+  const failure = new Error("replacement initialization failed");
+  const sessionDirectory = join(root, "pi-sessions");
+  let thrown: unknown;
+  try {
+    await prepareSessionHandoff(
+      transactionalContext(sourceCwd, targetCwd, sourceFile, switched),
+      targetCwd,
+      root,
+      {
+        withSession: async () => {
+          chmodSync(sessionDirectory, 0o500);
+          throw failure;
+        },
+      },
+    );
+  } catch (error) {
+    thrown = error;
+  } finally {
+    chmodSync(sessionDirectory, 0o700);
+  }
+
+  assert.ok(thrown instanceof AggregateError);
+  assert.equal(
+    thrown.message,
+    "Termia session handoff failed, rollback succeeded, and replacement cleanup failed",
+  );
+  assert.equal(thrown.errors[0], failure);
+  assert.deepEqual(switched.length, 2);
+  assert.equal(existsSync(sourceFile), true);
+  assert.equal(existsSync(switched[0]!), true);
+});
+
+test("reports a cancelled prepared rollback without claiming restoration", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-cancelled-rollback-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const switched: string[] = [];
+  const handoff = await prepareSessionHandoff(
+    transactionalContext(sourceCwd, targetCwd, sourceFile, switched, { cancelled: true }),
+    targetCwd,
+    root,
+  );
+  const replacementFile = switched[0]!;
+
+  await assert.rejects(handoff.rollback(), /could not roll back/);
+
+  assert.deepEqual(switched, [replacementFile, sourceFile]);
+  assert.equal(existsSync(sourceFile), true);
+  assert.equal(existsSync(replacementFile), true);
+});
+
+test("reports a thrown prepared rollback without claiming restoration", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-thrown-rollback-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const switched: string[] = [];
+  const failure = new Error("rollback hook failed");
+  const handoff = await prepareSessionHandoff(
+    transactionalContext(sourceCwd, targetCwd, sourceFile, switched, { error: failure }),
+    targetCwd,
+    root,
+  );
+  const replacementFile = switched[0]!;
+
+  await assert.rejects(handoff.rollback(), (error) => error === failure);
+
+  assert.deepEqual(switched, [replacementFile, sourceFile]);
+  assert.equal(existsSync(sourceFile), true);
+  assert.equal(existsSync(replacementFile), true);
+});
+
+test("commits a prepared handoff even when source archival fails", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-commit-cleanup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const switched: string[] = [];
+  const handoff = await prepareSessionHandoff(
+    transactionalContext(sourceCwd, targetCwd, sourceFile, switched),
+    targetCwd,
+    root,
+  );
+  const sessionDirectory = join(root, "pi-sessions");
+  let cleanupError: unknown;
+  chmodSync(sessionDirectory, 0o500);
+  try {
+    cleanupError = handoff.commit();
+  } finally {
+    chmodSync(sessionDirectory, 0o700);
+  }
+
+  assert.ok(cleanupError instanceof Error);
+  assert.equal(existsSync(sourceFile), true);
+  assert.equal(existsSync(switched[0]!), true);
+  assert.throws(() => handoff.commit(), /already settled/);
+});
+
+test("rolls back a prepared handoff even when replacement archival fails", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "termia-rollback-cleanup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceCwd = join(root, "source");
+  const targetCwd = join(root, "target");
+  mkdirSync(sourceCwd);
+  mkdirSync(targetCwd);
+  const sourceFile = createManagedSession(sourceCwd, root);
+  const switched: string[] = [];
+  const handoff = await prepareSessionHandoff(
+    transactionalContext(sourceCwd, targetCwd, sourceFile, switched),
+    targetCwd,
+    root,
+  );
+  const replacementFile = switched[0]!;
+  const sessionDirectory = join(root, "pi-sessions");
+  let rollback: Awaited<ReturnType<typeof handoff.rollback>>;
+  chmodSync(sessionDirectory, 0o500);
+  try {
+    rollback = await handoff.rollback();
+  } finally {
+    chmodSync(sessionDirectory, 0o700);
+  }
+
+  assert.equal(rollback.context?.cwd, sourceCwd);
+  assert.ok(rollback.cleanupError instanceof Error);
+  assert.equal(existsSync(sourceFile), true);
+  assert.equal(existsSync(replacementFile), true);
+  assert.throws(() => handoff.commit(), /already settled/);
 });
 
 test("starts Termia mode in a fresh managed session without copying the conversation", async (t) => {

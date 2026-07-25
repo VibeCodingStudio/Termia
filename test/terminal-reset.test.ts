@@ -54,6 +54,7 @@ function fakeRuntime(
   const workspace: ActiveWorkspace = {
     current: () => access,
     prepare: async () => ({ kind: "unchanged", active: access.summary }),
+    failClosed: () => {},
     [Symbol.asyncDispose]: async () => {
       order.push(`dispose-workspace:${name}`);
       if (options.disposeWorkspaceError !== undefined) {

@@ -9,6 +9,7 @@ export type SshHop = {
   host: string;
   port: number;
   controlPath: string;
+  localAnchor?: true;
 };
 
 export type WorkspaceTarget =

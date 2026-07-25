@@ -49,12 +49,44 @@ function wrapRemote(parent: SshHop, command: string): string {
   return `ssh -T -S ${quote(parent.controlPath)} ${quote(parent.destination)} ${quote(`exec ${command}`)}`;
 }
 
+export function activeRoute(hops: readonly SshHop[]): readonly SshHop[] {
+  let start = 0;
+  for (let index = 0; index < hops.length; index += 1) {
+    if (hops[index]?.localAnchor === true) start = index;
+  }
+  return hops.slice(start);
+}
+
 export function buildRemoteExecCommand(hops: readonly SshHop[], remoteCommand: string): string {
+  hops = activeRoute(hops);
   const leaf = hops.at(-1);
   if (leaf === undefined) throw new Error("Cannot execute without an SSH hop");
   validateField("remote command", remoteCommand);
   for (const hop of hops) validateHop(hop);
   let command = `ssh -T -S ${quote(leaf.controlPath)} ${quote(leaf.destination)} ${quote(remoteCommand)}`;
+  for (let index = hops.length - 2; index >= 0; index -= 1) {
+    const parent = hops[index];
+    if (parent === undefined) throw new Error("Invalid SSH hop chain");
+    command = wrapRemote(parent, command);
+  }
+  return command;
+}
+
+export function buildRemoteStreamCommand(
+  hops: readonly SshHop[],
+  host: string,
+  port: number,
+): string {
+  hops = activeRoute(hops);
+  const leaf = hops.at(-1);
+  if (leaf === undefined) throw new Error("Cannot stream without an SSH hop");
+  validateField("stream host", host);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("SSH stream port must be between 1 and 65535");
+  }
+  for (const hop of hops) validateHop(hop);
+  const endpoint = `${host.includes(":") ? `[${host}]` : host}:${port}`;
+  let command = `ssh -S ${quote(leaf.controlPath)} -W ${quote(endpoint)} ${quote(leaf.destination)}`;
   for (let index = hops.length - 2; index >= 0; index -= 1) {
     const parent = hops[index];
     if (parent === undefined) throw new Error("Invalid SSH hop chain");
@@ -83,6 +115,7 @@ export function buildRemoteBashCommand(
 }
 
 export function buildSftpBridgeScript(hops: readonly SshHop[]): string {
+  hops = activeRoute(hops);
   const leaf = hops.at(-1);
   if (leaf === undefined) throw new Error("Cannot build an SFTP bridge without an SSH hop");
   for (const hop of hops) validateHop(hop);
@@ -108,6 +141,7 @@ export function workspaceMountPath(hops: readonly SshHop[]): string {
 }
 
 function buildControlExitCommand(hops: readonly SshHop[]): string {
+  hops = activeRoute(hops);
   const leaf = hops.at(-1);
   if (leaf === undefined) throw new Error("Cannot close an empty SSH hop chain");
   for (const hop of hops) validateHop(hop);
@@ -376,7 +410,10 @@ export class SshChain {
     if (this.hops.some((state) => state.hop.shellId === event.shellId)) {
       throw new Error(`SSH shell is already in the hop chain: ${event.shellId}`);
     }
-    const { type: _type, cwd, ...hop } = event;
+    const { type: _type, cwd, ...eventHop } = event;
+    const hop: SshHop = this.hops.length === 0
+      ? { ...eventHop, localAnchor: true }
+      : eventHop;
     const state: HopState = {
       hop,
       cwd,

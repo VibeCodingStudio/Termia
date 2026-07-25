@@ -5,7 +5,10 @@ import { join } from "node:path";
 import test from "node:test";
 import type { SshOpenEvent } from "../extensions/termia/protocol.ts";
 import {
+  activeRoute,
   buildRemoteBashCommand,
+  buildRemoteExecCommand,
+  buildRemoteStreamCommand,
   buildSftpBridgeScript,
   prepareWorkspaceMountPath,
   SshChain,
@@ -47,6 +50,21 @@ const openB: SshOpenEvent = {
 };
 
 const hops: SshHop[] = [openA, openB].map(({ type: _type, cwd: _cwd, ...hop }) => hop);
+
+const rootA: SshHop = {
+  ...hops[0]!,
+  shellId: "shell-root",
+  parentShellId: "shell-a",
+  destination: "root@termia-identity-shell-root",
+  user: "root",
+  controlPath: "/tmp/termia-identity/control",
+  localAnchor: true,
+};
+
+const nestedB: SshHop = {
+  ...hops[1]!,
+  parentShellId: "shell-root",
+};
 
 class FakeMounts implements MountOperations {
   readonly unmounted: string[] = [];
@@ -109,6 +127,25 @@ test("builds non-interactive remote Bash through existing control sockets", () =
   assert.doesNotMatch(command, /printf 'one\\ntwo'/);
   assert.throws(() => buildRemoteBashCommand(hops, "relative", "true"), /absolute/);
   assert.throws(() => buildRemoteBashCommand(hops, "/srv/app", "bad\0command"), /NUL/);
+});
+
+test("starts transport at the newest local route anchor", () => {
+  const chain = [hops[0]!, rootA, nestedB];
+  assert.deepEqual(activeRoute(chain).map((hop) => hop.shellId), ["shell-root", "shell-b"]);
+
+  const command = buildRemoteExecCommand(chain, "id -un");
+  assert.doesNotMatch(command, /termia-a\/control/);
+  assert.match(command, /termia-identity\/control/);
+  assert.match(command, /termia-b\/control/);
+});
+
+test("builds a byte stream through the current route", () => {
+  const command = buildRemoteStreamCommand([hops[0]!, rootA, nestedB], "127.0.0.1", 45123);
+  assert.doesNotMatch(command, /termia-a\/control/);
+  assert.match(command, /termia-identity\/control/);
+  assert.match(command, /termia-b\/control/);
+  assert.match(command, /-W/);
+  assert.match(command, /127\.0\.0\.1:45123/);
 });
 
 test("names mount directories by hop depth and leaf identity", () => {
@@ -190,9 +227,13 @@ test("pushes only from the current leaf and pops to the retained parent", async 
   const chain = new SshChain(fileWorkspace("/work/project"), "local", mounts);
   chain.open(openA);
   chain.open(openB);
+  const ready = await chain.readyBinding("shell-b");
+  assert.equal(workspaceUri(ready.target), "ssh://bob@10.0.0.20:2222/srv/app");
   assert.equal(
-    workspaceUri((await chain.readyBinding("shell-b")).target),
-    "ssh://bob@10.0.0.20:2222/srv/app",
+    ready.target.scheme === "ssh"
+      ? ready.target.hops[0]?.localAnchor
+      : undefined,
+    true,
   );
   assert.throws(
     () => chain.open({ ...openA, parentShellId: "local", shellId: "side" }),

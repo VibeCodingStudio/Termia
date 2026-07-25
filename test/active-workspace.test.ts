@@ -64,15 +64,32 @@ class MemoryMounts implements MountOperations {
 }
 
 class MemoryIdentities implements IdentityOperations {
+  privateKey: string | undefined;
+  readonly closed: string[] = [];
+
   async open(
-    _event: IdentityOpenEvent,
-    _parentHops: readonly SshHop[],
-    _privateKey: string,
+    event: IdentityOpenEvent,
+    parentHops: readonly SshHop[],
+    privateKey: string,
   ): Promise<SshHop> {
-    throw new Error("identity routing is not used in this test");
+    const parent = parentHops.at(-1);
+    if (parent === undefined) throw new Error("missing identity parent");
+    this.privateKey = privateKey;
+    return {
+      shellId: event.shellId,
+      parentShellId: event.parentShellId,
+      destination: `${event.user}@termia-identity-${event.shellId}`,
+      user: event.user,
+      host: parent.host,
+      port: parent.port,
+      controlPath: `/tmp/termia-identity-${event.shellId}/control`,
+      localAnchor: true,
+    };
   }
 
-  async close(_shellId: string): Promise<void> {}
+  async close(shellId: string): Promise<void> {
+    this.closed.push(shellId);
+  }
   async dispose(): Promise<void> {}
 }
 
@@ -247,6 +264,49 @@ test("does not promote an ancestor until its real close event is committed", asy
   assert.equal(workspace.current().summary.uri, "ssh://bob@leaf/srv/app");
   parent.commit();
   assert.equal(workspace.current().summary.uri, "ssh://alice@parent/home/alice");
+});
+
+test("routes an identity workspace through the same prepare and commit boundary", async (t) => {
+  const identities = new MemoryIdentities();
+  const { workspace, terminal } = createActiveWorkspace(
+    "/work/project",
+    fakeDetached(),
+    new MemoryMounts(),
+    identities,
+  );
+  t.after(() => workspace[Symbol.asyncDispose]());
+  terminal.resetRoot("/work/project", "local");
+  terminal.openSsh({
+    type: "sshOpen",
+    shellId: "remote",
+    parentShellId: "local",
+    destination: "server",
+    user: "klein",
+    host: "server",
+    port: 22,
+    controlPath: "/tmp/termia-test-control",
+    cwd: "/srv/app",
+  });
+  terminal.openIdentity({
+    type: "identityOpen",
+    shellId: "root",
+    parentShellId: "remote",
+    user: "root",
+    cwd: "/root",
+    port: 45123,
+    hostKey: "ssh-ed25519 AAAA",
+  }, "/tmp/termia-private-key");
+
+  const activation = await workspace.prepare("root");
+  assert.equal(activation.kind, "ready");
+  assert.equal(activation.pending.uri, "ssh://root@server/root");
+  assert.equal(workspace.current().summary.uri, "file:///work/project");
+  activation.commit();
+  assert.equal(workspace.current().summary.uri, "ssh://root@server/root");
+  assert.equal(identities.privateKey, "/tmp/termia-private-key");
+
+  await terminal.close("root");
+  assert.deepEqual(identities.closed, ["root"]);
 });
 
 test("keeps a remote Active identity when the terminal exits", async (t) => {
@@ -599,4 +659,13 @@ test("keeps local detached Bash usable after an isolated timeout", async (t) => 
   });
   assert.equal(result.exitCode, 0);
   assert.equal(Buffer.concat(output).toString(), "after-timeout");
+});
+
+test("retains the last verified local cwd for Terminal Reset", async (t) => {
+  const facets = createActiveWorkspace("/work/project", fakeDetached());
+  t.after(() => facets.workspace[Symbol.asyncDispose]());
+  facets.terminal.resetRoot("/work/project", "local-shell");
+  facets.terminal.updateCwd("local-shell", "/work/next");
+
+  assert.equal(facets.terminal.localCwd(), "/work/next");
 });

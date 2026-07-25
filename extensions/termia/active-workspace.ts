@@ -94,6 +94,7 @@ export interface TerminalWorkspaceFeed {
   updateCwd(shellId: string, cwd: string): void;
   close(shellId: string): Promise<void>;
   contextFor(shellId: string, cwd?: string): WorkspaceContext;
+  localCwd(): string;
   terminalExited(): Promise<void>;
 }
 
@@ -110,6 +111,8 @@ class ActiveWorkspaceState {
   private availability: WorkspaceAvailability = { kind: "available" };
   private terminalCleanup: Promise<void> | undefined;
   private finalDisposal: Promise<void> | undefined;
+  private rootShellId = "local";
+  private localCwdValue: string;
 
   constructor(
     cwd: string,
@@ -119,6 +122,7 @@ class ActiveWorkspaceState {
   ) {
     this.detached = detached;
     this.active = fileWorkspace(cwd);
+    this.localCwdValue = this.active.piCwd;
     this.chain = new SshChain(this.active, "local", mounts, identities);
   }
 
@@ -261,6 +265,8 @@ class ActiveWorkspaceState {
 
   resetRoot(cwd: string, shellId: string): void {
     this.chain.resetRoot(fileWorkspace(cwd), shellId);
+    this.rootShellId = shellId;
+    this.localCwdValue = fileWorkspace(cwd).piCwd;
     this.terminalCleanup = undefined;
     this.topologyRevision += 1;
   }
@@ -277,6 +283,7 @@ class ActiveWorkspaceState {
 
   updateCwd(shellId: string, cwd: string): void {
     this.chain.updateCwd(shellId, cwd);
+    if (shellId === this.rootShellId) this.localCwdValue = fileWorkspace(cwd).piCwd;
     this.topologyRevision += 1;
   }
 
@@ -287,6 +294,10 @@ class ActiveWorkspaceState {
 
   contextFor(shellId: string, cwd?: string): WorkspaceContext {
     return this.chain.contextFor(shellId, cwd);
+  }
+
+  localCwd(): string {
+    return this.localCwdValue;
   }
 
   async terminalExited(): Promise<void> {
@@ -361,6 +372,7 @@ export function createActiveWorkspace(
       updateCwd: (shellId, updatedCwd) => state.updateCwd(shellId, updatedCwd),
       close: (shellId) => state.close(shellId),
       contextFor: (shellId, contextCwd) => state.contextFor(shellId, contextCwd),
+      localCwd: () => state.localCwd(),
       terminalExited: () => state.terminalExited(),
     },
   };

@@ -9,8 +9,6 @@ import type { TerminalWorkspaceFeed } from "./active-workspace.ts";
 import { HistoryStore } from "./history.ts";
 import { createIdentityRuntime, type IdentityRuntime } from "./identity-runtime.ts";
 import { ProtocolParser, type ProtocolToken } from "./protocol.ts";
-import { SshChain, type IdentityOperations, type MountOperations } from "./ssh-workspace.ts";
-import { fileWorkspace, type WorkspaceBinding } from "./workspace.ts";
 
 type TerminalContext = Pick<ExtensionCommandContext, "ui">;
 type CommandListener = (command: CommandRecord) => void;
@@ -58,8 +56,7 @@ export class TerminalController {
   private readonly parser = new ProtocolParser();
   private readonly listeners = new Set<CommandListener>();
   private readonly history: HistoryStore;
-  private readonly sshChain: SshChain;
-  private readonly shadowWorkspaces: TerminalWorkspaceFeed | undefined;
+  private readonly workspaces: TerminalWorkspaceFeed;
   private identityRuntime: IdentityRuntime | undefined;
   private subscriptions: IDisposable[] = [];
   private pty: IPty | undefined;
@@ -75,15 +72,9 @@ export class TerminalController {
   private readonly observedHistoryIds = new Map<string, number>();
   private readonly manualCommandStartedAt = new Map<string, number>();
 
-  constructor(
-    history: HistoryStore,
-    mounts?: MountOperations,
-    identities?: IdentityOperations,
-    shadowWorkspaces?: TerminalWorkspaceFeed,
-  ) {
+  constructor(history: HistoryStore, workspaces: TerminalWorkspaceFeed) {
     this.history = history;
-    this.sshChain = new SshChain(fileWorkspace(process.cwd()), "local", mounts, identities);
-    this.shadowWorkspaces = shadowWorkspaces;
+    this.workspaces = workspaces;
   }
 
   get cwd(): string {
@@ -94,26 +85,6 @@ export class TerminalController {
     return this.pty !== undefined;
   }
 
-  get workspace(): WorkspaceBinding {
-    return this.sshChain.currentBinding;
-  }
-
-  readyWorkspace(shellId: string): Promise<WorkspaceBinding> {
-    return this.sshChain.readyBinding(shellId);
-  }
-
-  nearestLiveWorkspace(): WorkspaceBinding {
-    return this.sshChain.nearestLiveBinding();
-  }
-
-  isWorkspaceHealthy(binding: WorkspaceBinding): boolean {
-    return this.sshChain.isHealthy(binding);
-  }
-
-  assertWorkspace(cwd: string): void {
-    this.sshChain.assertPhysicalWorkspace(cwd);
-  }
-
   start(cwd: string, shell = process.env.SHELL ?? "/bin/bash"): void {
     if (this.pty !== undefined) return;
     if (!statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
@@ -122,8 +93,7 @@ export class TerminalController {
     this.identityRuntime = identityRuntime;
 
     const terminalId = randomUUID();
-    this.sshChain.resetRoot(fileWorkspace(cwd), terminalId);
-    this.shadowWorkspaces?.resetRoot(cwd, terminalId);
+    this.workspaces.resetRoot(cwd, terminalId);
     this.history.startTerminal({ id: terminalId, shell, cwd });
     let child: IPty;
     try {
@@ -306,12 +276,7 @@ export class TerminalController {
     }
     this.identityRuntime?.dispose();
     this.identityRuntime = undefined;
-    void this.sshChain.dispose();
-    void this.shadowWorkspaces?.terminalExited().catch(() => {});
-  }
-
-  async disposeWorkspaces(): Promise<void> {
-    await this.sshChain.dispose();
+    void this.workspaces.terminalExited().catch(() => {});
   }
 
   private consume(data: string): void {
@@ -338,8 +303,7 @@ export class TerminalController {
           this.manualCommandStartedAt.delete(token.shellId);
         }
         this.cwdValue = token.cwd;
-        this.sshChain.updateCwd(token.shellId, token.cwd);
-        this.shadowWorkspaces?.updateCwd(token.shellId, token.cwd);
+        this.workspaces.updateCwd(token.shellId, token.cwd);
         this.shellReady = true;
         if (
           this.execution?.aborting
@@ -369,18 +333,17 @@ export class TerminalController {
           this.execution.sequence = { shellId: token.shellId, value: token.sequence };
           this.history.startCommand(
             { ...token, command: this.execution.command },
-            this.sshChain.contextFor(token.shellId, token.cwd),
+            this.workspaces.contextFor(token.shellId, token.cwd),
           );
           if (this.execution.aborting) this.pty?.write("\u0003");
         } else {
-          this.history.startCommand(token, this.sshChain.contextFor(token.shellId, token.cwd));
+          this.history.startCommand(token, this.workspaces.contextFor(token.shellId, token.cwd));
         }
         break;
       case "end": {
         this.activeShellId = token.shellId;
         this.cwdValue = token.cwd;
-        this.sshChain.updateCwd(token.shellId, token.cwd);
-        this.shadowWorkspaces?.updateCwd(token.shellId, token.cwd);
+        this.workspaces.updateCwd(token.shellId, token.cwd);
         const command = this.history.endCommand(token);
         if (command !== undefined) {
           for (const listener of this.listeners) listener(command);
@@ -403,7 +366,7 @@ export class TerminalController {
         const endedAt = Date.now();
         const command = this.history.recordObservedCommand(
           token,
-          this.sshChain.contextFor(token.shellId, boundary.cwd),
+          this.workspaces.contextFor(token.shellId, boundary.cwd),
           boundary,
           this.manualCommandStartedAt.get(token.shellId) ?? endedAt,
           endedAt,
@@ -411,15 +374,13 @@ export class TerminalController {
         this.manualCommandStartedAt.delete(token.shellId);
         this.activeShellId = token.shellId;
         this.cwdValue = token.cwd;
-        this.sshChain.updateCwd(token.shellId, token.cwd);
-        this.shadowWorkspaces?.updateCwd(token.shellId, token.cwd);
+        this.workspaces.updateCwd(token.shellId, token.cwd);
         for (const listener of this.listeners) listener(command);
         break;
       }
       case "sshOpen":
         try {
-          this.sshChain.open(token);
-          this.shadowWorkspaces?.openSsh(token);
+          this.workspaces.openSsh(token);
           this.history.discardActiveCommand(token.parentShellId);
         } catch (error) {
           const message = `termia: ignored SSH workspace event: ${error instanceof Error ? error.message : String(error)}\n`;
@@ -435,8 +396,7 @@ export class TerminalController {
         try {
           const privateKey = this.identityRuntime?.privateKey;
           if (privateKey === undefined) throw new Error("identity credentials are unavailable");
-          this.sshChain.openIdentity(token, privateKey);
-          this.shadowWorkspaces?.openIdentity(token, privateKey);
+          this.workspaces.openIdentity(token, privateKey);
           this.history.discardActiveCommand(token.parentShellId);
         } catch (error) {
           const message = `termia: ignored identity workspace event: ${error instanceof Error ? error.message : String(error)}\n`;
@@ -456,8 +416,7 @@ export class TerminalController {
         this.observedHistoryIds.delete(token.shellId);
         this.manualCommandStartedAt.delete(token.shellId);
         if (this.activeShellId === token.shellId && parent !== undefined) this.activeShellId = parent;
-        void this.sshChain.close(token.shellId).catch(() => {});
-        void this.shadowWorkspaces?.close(token.shellId).catch(() => {});
+        void this.workspaces.close(token.shellId).catch(() => {});
         break;
       }
     }
@@ -479,8 +438,7 @@ export class TerminalController {
     this.history.endTerminal();
     this.identityRuntime?.dispose();
     this.identityRuntime = undefined;
-    void this.sshChain.dispose();
-    void this.shadowWorkspaces?.terminalExited().catch(() => {});
+    void this.workspaces.terminalExited().catch(() => {});
     const execution = this.execution;
     if (execution !== undefined) {
       this.clearExecution(execution);

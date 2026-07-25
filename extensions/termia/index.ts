@@ -4,11 +4,14 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import {
-  createBashToolDefinition,
   createLocalBashOperations,
   getAgentDir,
-  isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
+import {
+  createActiveWorkspace,
+  type ActiveWorkspace,
+  type TerminalWorkspaceFeed,
+} from "./active-workspace.ts";
 import {
   installBangEditor,
   parseTermiaInvocation,
@@ -29,25 +32,26 @@ import {
   termiaRoot,
   withTermiaHistoryTool,
 } from "./mode.ts";
-import { createModeBashOperations } from "./pty-bash.ts";
+import {
+  installPiWorkspaceAdapter,
+  type PiWorkspaceAdapter,
+} from "./pi-workspace.ts";
 import {
   handoffSession,
   isManagedSession,
   releaseManagedSession,
   startManagedSession,
-  type SessionTransitionOptions,
 } from "./session.ts";
 import {
   isTermiaPty,
   TerminalController,
 } from "./terminal.ts";
-import {
-  applyWorkspaceToolPolicy,
-  fileWorkspace,
-  presentWorkspaceCwd,
-  workspaceUri,
-  type WorkspaceBinding,
-} from "./workspace.ts";
+
+type WorkspaceRuntime = {
+  workspace: ActiveWorkspace;
+  terminalFeed: TerminalWorkspaceFeed;
+  terminal: TerminalController;
+};
 
 type TermiaRuntime = {
   api: ExtensionAPI | undefined;
@@ -56,11 +60,11 @@ type TermiaRuntime = {
   shortcutHintShown: boolean;
   editorDraft: string | undefined;
   history: HistoryStore;
-  terminal: TerminalController;
+  localBash: BashOperations;
+  workspaceRuntime: WorkspaceRuntime;
+  piWorkspace: PiWorkspaceAdapter | undefined;
   editorFactory: EditorFactory | undefined;
   agentActive: boolean;
-  piCwd: string;
-  binding: WorkspaceBinding;
 };
 
 type BangExecutionOutcome =
@@ -75,10 +79,36 @@ const ROOT = termiaRoot(getAgentDir());
 const BANG_RESULT_TYPE = "termia.command";
 const TERMIA_DISABLED_NOTICE = "Termia is disabled; run /termia to enable it";
 
+function createWorkspaceRuntime(
+  cwd: string,
+  history: HistoryStore,
+  localBash: BashOperations,
+): WorkspaceRuntime {
+  const facets = createActiveWorkspace(cwd, {
+    run: ({ command, cwd: commandCwd, options }) =>
+      localBash.exec(command, commandCwd, options),
+  });
+  return {
+    workspace: facets.workspace,
+    terminalFeed: facets.terminal,
+    terminal: new TerminalController(history, facets.terminal),
+  };
+}
+
+async function replaceWorkspaceRuntime(
+  state: TermiaRuntime,
+  next: WorkspaceRuntime,
+): Promise<void> {
+  const previous = state.workspaceRuntime;
+  state.workspaceRuntime = next;
+  previous.terminal.dispose();
+  await previous.workspace[Symbol.asyncDispose]();
+}
+
 function runtime(): TermiaRuntime {
   if (globalThis.__termiaPiRuntime === undefined) {
     const history = new HistoryStore(ROOT);
-    const binding = fileWorkspace(process.cwd());
+    const localBash = createLocalBashOperations();
     globalThis.__termiaPiRuntime = {
       api: undefined,
       enabled: false,
@@ -86,43 +116,25 @@ function runtime(): TermiaRuntime {
       shortcutHintShown: false,
       editorDraft: undefined,
       history,
-      terminal: new TerminalController(history),
+      localBash,
+      workspaceRuntime: createWorkspaceRuntime(process.cwd(), history, localBash),
+      piWorkspace: undefined,
       editorFactory: undefined,
       agentActive: false,
-      piCwd: binding.piCwd,
-      binding,
     };
   }
   return globalThis.__termiaPiRuntime;
 }
 
-function setBinding(state: TermiaRuntime, binding: WorkspaceBinding): void {
-  state.binding = binding;
-  state.piCwd = binding.piCwd;
-}
-
-async function handoffWorkspace(
-  ctx: ExtensionCommandContext,
-  state: TermiaRuntime,
-  binding: WorkspaceBinding,
-  options?: SessionTransitionOptions,
-): Promise<{ cancelled: boolean; switched: boolean }> {
-  const previous = state.binding;
-  setBinding(state, binding);
-  try {
-    const result = await handoffSession(ctx, binding.piCwd, ROOT, options);
-    if (result.cancelled) setBinding(state, previous);
-    return result;
-  } catch (error) {
-    setBinding(state, previous);
-    throw error;
+function piWorkspace(state: TermiaRuntime): PiWorkspaceAdapter {
+  if (state.piWorkspace === undefined) {
+    throw new Error("Termia Pi workspace adapter is not installed");
   }
+  return state.piWorkspace;
 }
 
 function showWorkspace(ctx: Pick<ExtensionCommandContext, "ui">, state: TermiaRuntime): void {
-  if (!state.enabled) return;
-  const uri = workspaceUri(state.binding.target);
-  ctx.ui.setTitle(`Termia — ${uri}`);
+  piWorkspace(state).show(ctx);
 }
 
 function restoreEditorDraft(
@@ -153,20 +165,8 @@ async function enterTerminal(
   ctx: ExtensionCommandContext,
   state: TermiaRuntime,
 ): Promise<void> {
-  if (state.terminal.running && !state.terminal.isWorkspaceHealthy(state.binding)) {
-    const binding = state.terminal.nearestLiveWorkspace();
-    const result = await handoffWorkspace(ctx, state, binding, {
-      withSession: async (replacementCtx) => {
-        await enterTerminal(replacementCtx, state);
-      },
-    });
-    if (result.switched) return;
-    if (result.cancelled) {
-      ctx.ui.notify("Termia workspace recovery was cancelled", "warning");
-      return;
-    }
-  }
-  if (!state.terminal.running) state.terminal.start(ctx.cwd);
+  const runtime = state.workspaceRuntime;
+  if (!runtime.terminal.running) runtime.terminal.start(runtime.terminalFeed.localCwd());
   await terminalLoop(state, ctx);
 }
 
@@ -174,29 +174,8 @@ async function terminalLoop(
   state: TermiaRuntime,
   ctx: ExtensionCommandContext,
 ): Promise<void> {
-  const exit = await state.terminal.enter(ctx);
-  const binding = await state.terminal.readyWorkspace(exit.shellId);
-  if (binding.piCwd === ctx.cwd) {
-    setBinding(state, binding);
-    showWorkspace(ctx, state);
-    return;
-  }
-  const result = await handoffWorkspace(ctx, state, binding);
-  if (result.cancelled) ctx.ui.notify("Termia cwd change was cancelled", "warning");
-}
-
-async function restoreTerminalCwd(
-  ctx: ExtensionCommandContext,
-  state: TermiaRuntime,
-  cwd: string,
-): Promise<void> {
-  try {
-    await state.terminal.restoreCwd(cwd);
-  } catch (error) {
-    state.terminal.dispose();
-    ctx.ui.notify(`Termia cwd recovery failed: ${errorMessage(error)}`, "error");
-    throw error;
-  }
+  const exit = await state.workspaceRuntime.terminal.enter(ctx);
+  await piWorkspace(state).activate(ctx, exit.shellId);
 }
 
 async function executeBang(
@@ -205,11 +184,8 @@ async function executeBang(
   state: TermiaRuntime,
   invocation: Extract<TermiaInvocation, { type: "bang" }>,
 ): Promise<void> {
-  const originalCwd = ctx.cwd;
-  const originalTerminalCwd = state.binding.target.scheme === "ssh"
-    ? state.binding.target.path
-    : originalCwd;
-  if (!state.terminal.running) state.terminal.start(originalCwd);
+  const terminal = state.workspaceRuntime.terminal;
+  if (!terminal.running) terminal.start(state.workspaceRuntime.terminalFeed.localCwd());
 
   const outcome = await ctx.ui.custom<BangExecutionOutcome>(
     (tui, theme, _keybindings, done) => {
@@ -219,7 +195,7 @@ async function executeBang(
         theme,
         () => abortController.abort(),
       );
-      state.terminal.execute(invocation.command, {
+      terminal.execute(invocation.command, {
         signal: abortController.signal,
         onOutput: (data) => {
           view.append(data);
@@ -237,7 +213,7 @@ async function executeBang(
   const data = createBangResultData(
     invocation.command,
     outcome.record,
-    state.terminal.cwd,
+    terminal.cwd,
     state.history.readOutput(outcome.record),
   );
   if (invocation.excludeFromContext) {
@@ -256,23 +232,16 @@ async function executeBang(
 
   const sourceFile = ctx.sessionManager.getSessionFile();
   if (sourceFile === undefined) throw new Error("Termia cannot move an ephemeral Pi session");
-  const binding = await state.terminal.readyWorkspace(outcome.record.shellId);
-  const cwdChanged = binding.piCwd !== originalCwd;
-  if (!cwdChanged && isManagedSession(sourceFile, ROOT)) return;
-  try {
-    const handoff = await handoffWorkspace(ctx, state, binding);
-    if (!handoff.cancelled) return;
-    if (cwdChanged) {
-      await restoreTerminalCwd(ctx, state, originalTerminalCwd);
-      ctx.ui.notify("Termia cwd change was cancelled; shell cwd restored", "warning");
-    } else {
-      ctx.ui.notify("Termia session handoff was cancelled", "warning");
-    }
-  } catch (error) {
-    if (state.terminal.running && state.terminal.cwd !== originalTerminalCwd) {
-      await restoreTerminalCwd(ctx, state, originalTerminalCwd);
-    }
-    throw error;
+  const activation = await piWorkspace(state).activate(ctx, outcome.record.shellId);
+  if (activation !== "unchanged" || isManagedSession(sourceFile, ROOT)) return;
+
+  const handoff = await handoffSession(
+    ctx,
+    state.workspaceRuntime.workspace.current().executionDirectory(),
+    ROOT,
+  );
+  if (handoff.cancelled) {
+    ctx.ui.notify("Termia session handoff was cancelled", "warning");
   }
 }
 
@@ -302,7 +271,6 @@ function applyMode(state: TermiaRuntime, enabled: boolean): void {
   if (api === undefined) throw new Error("Termia extension runtime is not active");
   synchronizeHistoryTool(api, enabled);
   state.enabled = enabled;
-  if (!enabled) state.terminal.dispose();
 }
 
 async function toggleTermiaMode(
@@ -343,7 +311,10 @@ async function toggleTermiaMode(
             withSession: async (replacementCtx) => {
               applyMode(state, false);
               state.previousSessionFile = undefined;
-              setBinding(state, fileWorkspace(replacementCtx.cwd));
+              await replaceWorkspaceRuntime(
+                state,
+                createWorkspaceRuntime(replacementCtx.cwd, state.history, state.localBash),
+              );
               notifySwitched = () => replacementCtx.ui.notify("Termia disabled", "info");
             },
           });
@@ -369,42 +340,12 @@ export default function termia(pi: ExtensionAPI): void {
   const state = runtime();
   state.api = pi;
   pi.registerTool(createHistoryTool(state.history));
-  const bashOperations: BashOperations = createModeBashOperations(
-    () => state.enabled,
-    createLocalBashOperations(),
-    state.terminal,
-  );
-  pi.registerTool(createBashToolDefinition(state.piCwd, {
-    operations: bashOperations,
-    spawnHook: (context) => ({ ...context, cwd: state.piCwd }),
-  }));
-
-  pi.on("tool_call", (event) => {
-    if (!state.enabled) return;
-    const workspaceTool = isToolCallEventType("bash", event)
-      || isToolCallEventType("read", event)
-      || isToolCallEventType("edit", event)
-      || isToolCallEventType("write", event)
-      || isToolCallEventType("grep", event)
-      || isToolCallEventType("find", event)
-      || isToolCallEventType("ls", event);
-    if (!workspaceTool) return;
-    return applyWorkspaceToolPolicy(
-      { toolName: event.toolName, input: event.input as Record<string, unknown> },
-      state.binding,
-      state.terminal.isWorkspaceHealthy(state.binding),
-    );
-  });
-
-  pi.on("before_agent_start", (event) => {
-    if (!state.enabled || state.binding.target.scheme !== "ssh") return;
-    return {
-      systemPrompt: presentWorkspaceCwd(
-        event.systemPrompt,
-        state.binding,
-        event.systemPromptOptions.skills,
-      ),
-    };
+  state.piWorkspace = installPiWorkspaceAdapter({
+    pi,
+    workspace: () => state.workspaceRuntime.workspace,
+    enabled: () => state.enabled,
+    localBash: state.localBash,
+    root: ROOT,
   });
 
   pi.on("agent_start", () => {
@@ -445,9 +386,10 @@ export default function termia(pi: ExtensionAPI): void {
     );
     restoreEditorDraft(ctx, state);
     if (!state.enabled) {
-      setBinding(state, fileWorkspace(ctx.cwd));
-      showWorkspace(ctx, state);
-      state.terminal.dispose();
+      await replaceWorkspaceRuntime(
+        state,
+        createWorkspaceRuntime(ctx.cwd, state.history, state.localBash),
+      );
       try {
         synchronizeHistoryTool(pi, false);
       } catch (error) {
@@ -455,22 +397,7 @@ export default function termia(pi: ExtensionAPI): void {
       }
       return;
     }
-    if (state.binding.piCwd !== ctx.cwd) {
-      if (state.binding.target.scheme === "ssh") state.terminal.dispose();
-      setBinding(state, fileWorkspace(ctx.cwd));
-    }
     showWorkspace(ctx, state);
-    if (
-      state.terminal.running
-      && state.binding.target.scheme === "file"
-      && state.terminal.cwd !== ctx.cwd
-    ) {
-      try {
-        await state.terminal.restoreCwd(ctx.cwd);
-      } catch {
-        state.terminal.dispose();
-      }
-    }
   });
 
   pi.registerCommand("termia", {
@@ -556,7 +483,8 @@ export default function termia(pi: ExtensionAPI): void {
     const state = globalThis.__termiaPiRuntime;
     if (state === undefined) return;
     try {
-      state.terminal.dispose();
+      state.workspaceRuntime.terminal.dispose();
+      void state.workspaceRuntime.workspace[Symbol.asyncDispose]();
     } finally {
       state.history.close();
       globalThis.__termiaPiRuntime = undefined;

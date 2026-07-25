@@ -17,10 +17,7 @@ import { createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 import type { IPty } from "node-pty";
 import { createActiveWorkspace } from "../extensions/termia/active-workspace.ts";
 import { HistoryStore, type CommandRecord } from "../extensions/termia/history.ts";
-import type { IdentityOpenEvent, SshOpenEvent } from "../extensions/termia/protocol.ts";
-import type { IdentityOperations, MountOperations } from "../extensions/termia/ssh-workspace.ts";
 import { isTermiaPty, TerminalController } from "../extensions/termia/terminal.ts";
-import { sshWorkspace, workspaceUri, type SshHop, type WorkspaceBinding } from "../extensions/termia/workspace.ts";
 
 const zsh = process.env.TERMIA_TEST_ZSH ?? (existsSync("/bin/zsh") ? "/bin/zsh" : undefined);
 const ash = process.env.TERMIA_TEST_ASH;
@@ -69,6 +66,13 @@ function installFakePty(controller: TerminalController, explicit = false): strin
   return writes;
 }
 
+function createTestTerminal(history: HistoryStore): TerminalController {
+  const { terminal } = createActiveWorkspace(process.cwd(), {
+    run: async () => ({ exitCode: 0 }),
+  });
+  return new TerminalController(history, terminal);
+}
+
 test("detects only the Termia PTY marker", () => {
   assert.equal(isTermiaPty("1"), true);
   assert.equal(isTermiaPty("0"), false);
@@ -85,12 +89,7 @@ test("publishes shell workspace facts through TerminalWorkspaceFeed", async (t) 
     run: ({ command, cwd: commandCwd, options }) =>
       local.exec(command, commandCwd, options),
   });
-  const controller = new TerminalController(
-    store,
-    undefined,
-    undefined,
-    facets.terminal,
-  );
+  const controller = new TerminalController(store, facets.terminal);
   t.after(async () => {
     controller.dispose();
     await facets.workspace[Symbol.asyncDispose]();
@@ -112,7 +111,7 @@ test("uses and removes a private runtime hook directory", async (t) => {
   const cwd = join(root, "cwd");
   mkdirSync(cwd);
   const store = new HistoryStore(join(root, "state"));
-  const controller = new TerminalController(store);
+  const controller = createTestTerminal(store);
   t.after(() => {
     controller.dispose();
     store.close();
@@ -137,7 +136,7 @@ test("uses and removes a private runtime hook directory", async (t) => {
 test("chunks long explicit execution input below the ash line limit", async () => {
   const root = mkdtempSync(join(tmpdir(), "termia-terminal-chunks-"));
   const store = new HistoryStore(join(root, "state"));
-  const controller = new TerminalController(store);
+  const controller = createTestTerminal(store);
   const writes = installFakePty(controller, true);
   const command = `printf '%s' '${"x".repeat(600)}'`;
   const pending = controller.execute(command);
@@ -165,7 +164,7 @@ test("chunks long explicit execution input below the ash line limit", async () =
 test("interrupts written commands before the shell start marker", async () => {
   const root = mkdtempSync(join(tmpdir(), "termia-terminal-prestart-"));
   const store = new HistoryStore(join(root, "state"));
-  const controller = new TerminalController(store);
+  const controller = createTestTerminal(store);
   const writes = installFakePty(controller);
   const abort = new AbortController();
   const pending = controller.execute("true", { signal: abort.signal });
@@ -189,7 +188,7 @@ async function verifyPersistentShell(shell: string): Promise<void> {
   const target = join(cwd, "target");
   mkdirSync(target, { recursive: true });
   const store = new HistoryStore(join(root, "state"));
-  const controller = new TerminalController(store);
+  const controller = createTestTerminal(store);
 
   try {
     controller.start(cwd, shell);
@@ -294,7 +293,7 @@ for (const shellName of ["ash", "sh"] as const) {
       symlinkSync(busybox, shell);
     }
     const store = new HistoryStore(join(root, "state"));
-    const controller = new TerminalController(store);
+    const controller = createTestTerminal(store);
 
     try {
       controller.start(cwd, shell);
@@ -329,7 +328,7 @@ test("runs Agent commands in BusyBox ash", { skip: ash === undefined }, async ()
   const shell = join(root, "ash");
   symlinkSync(ash!, shell);
   const store = new HistoryStore(join(root, "state"));
-  const controller = new TerminalController(store);
+  const controller = createTestTerminal(store);
 
   try {
     controller.start(cwd, shell);
@@ -378,7 +377,7 @@ test("runs Agent commands in BusyBox ash", { skip: ash === undefined }, async ()
 test("allows only one terminal attachment", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "termia-terminal-attach-"));
   const store = new HistoryStore(join(root, "state"));
-  const controller = new TerminalController(store);
+  const controller = createTestTerminal(store);
   const writes = installFakePty(controller);
   const stdinDescriptors = {
     isTTY: Object.getOwnPropertyDescriptor(process.stdin, "isTTY"),
@@ -468,183 +467,4 @@ test("allows only one terminal attachment", async (t) => {
   }
   assert.equal(process.stdin.listenerCount("data"), baselineListeners);
   assert.equal(starts, 1);
-});
-
-class TerminalMounts implements MountOperations {
-  private readonly bindings = new Map<string, WorkspaceBinding>();
-
-  async mount(hops: readonly SshHop[], cwd: string): Promise<WorkspaceBinding> {
-    const shellId = hops.at(-1)?.shellId;
-    if (shellId === undefined) throw new Error("missing shell");
-    const binding = sshWorkspace(hops, cwd, `/tmp/mount-${shellId}`);
-    this.bindings.set(shellId, binding);
-    return binding;
-  }
-
-  updateCwd(binding: WorkspaceBinding, cwd: string): WorkspaceBinding {
-    if (binding.target.scheme !== "ssh" || binding.mountRoot === undefined) return binding;
-    return sshWorkspace(binding.target.hops, cwd, binding.mountRoot);
-  }
-
-  health(shellId: string): boolean {
-    return this.bindings.has(shellId);
-  }
-
-  async unmount(shellId: string): Promise<void> {
-    this.bindings.delete(shellId);
-  }
-
-  async dispose(): Promise<void> {
-    this.bindings.clear();
-  }
-}
-
-class TerminalIdentities implements IdentityOperations {
-  privateKey: string | undefined;
-  readonly closed: string[] = [];
-
-  async open(
-    event: IdentityOpenEvent,
-    parentHops: readonly SshHop[],
-    privateKey: string,
-  ): Promise<SshHop> {
-    this.privateKey = privateKey;
-    const parent = parentHops.at(-1)!;
-    return {
-      shellId: event.shellId,
-      parentShellId: event.parentShellId,
-      destination: `${event.user}@termia-identity-${event.shellId}`,
-      user: event.user,
-      host: parent.host,
-      port: parent.port,
-      controlPath: `/tmp/identity-${event.shellId}/control`,
-      localAnchor: true,
-    };
-  }
-
-  async close(shellId: string): Promise<void> {
-    this.closed.push(shellId);
-  }
-
-  async dispose(): Promise<void> {}
-}
-
-test("routes SSH protocol events into workspace bindings", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "termia-terminal-workspace-"));
-  const cwd = join(root, "cwd");
-  mkdirSync(cwd);
-  const store = new HistoryStore(join(root, "state"));
-  const controller = new TerminalController(store, new TerminalMounts());
-  t.after(() => {
-    controller.dispose();
-    store.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  controller.start(cwd, "/bin/bash");
-  await controller.execute("true");
-
-  const parentShellId = Reflect.get(controller, "activeShellId") as string;
-  const consume = Reflect.get(controller, "consumeToken") as (token: unknown) => void;
-  assert.doesNotThrow(() => consume.call(controller, {
-    type: "sshOpen",
-    parentShellId: "not-the-leaf",
-    shellId: "forged",
-    destination: "host-forged",
-    user: "mallory",
-    host: "127.0.0.1",
-    port: 22,
-    controlPath: "/tmp/forged/control",
-    cwd: "/tmp",
-  }));
-  assert.equal(controller.workspace.piCwd, cwd);
-  const open: SshOpenEvent = {
-    type: "sshOpen",
-    parentShellId,
-    shellId: "shell-a",
-    destination: "host-a",
-    user: "alice",
-    host: "10.0.0.10",
-    port: 22,
-    controlPath: "/tmp/termia-a/control",
-    cwd: "/home/alice",
-  };
-  consume.call(controller, open);
-
-  assert.equal(
-    workspaceUri((await controller.readyWorkspace("shell-a")).target),
-    "ssh://alice@10.0.0.10/home/alice",
-  );
-  consume.call(controller, {
-    type: "ready",
-    shellId: "shell-a",
-    cwd: "/srv/app",
-    explicitExec: true,
-  });
-  assert.equal(controller.workspace.piCwd, "/tmp/mount-shell-a/srv/app");
-  const observedRecord = waitForCommand(controller, "pwd");
-  consume.call(controller, { type: "output", data: "[termia] /srv/app $ pwd\r\n/srv/app\r\n" });
-  consume.call(controller, {
-    type: "observed",
-    shellId: "shell-a",
-    historyId: 1,
-    cwd: "/srv/app",
-    command: "pwd",
-    exitCode: 0,
-  });
-  const observed = await observedRecord;
-  assert.equal(observed.workspaceUri, "ssh://alice@10.0.0.10/srv/app");
-  assert.equal(store.readOutput(observed), "/srv/app\r\n");
-  consume.call(controller, { type: "sshClose", shellId: "shell-a" });
-  await new Promise<void>((resolveTick) => setImmediate(resolveTick));
-  assert.equal(controller.workspace.piCwd, cwd);
-});
-
-test("routes identity events to the switched-user workspace", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "termia-terminal-identity-"));
-  const cwd = join(root, "cwd");
-  mkdirSync(cwd);
-  const store = new HistoryStore(join(root, "state"));
-  const identities = new TerminalIdentities();
-  const controller = new TerminalController(store, new TerminalMounts(), identities);
-  t.after(() => {
-    controller.dispose();
-    store.close();
-    rmSync(root, { recursive: true, force: true });
-  });
-  controller.start(cwd, "/bin/bash");
-  await controller.execute("true");
-
-  const parentShellId = Reflect.get(controller, "activeShellId") as string;
-  const consume = Reflect.get(controller, "consumeToken") as (token: unknown) => void;
-  consume.call(controller, {
-    type: "sshOpen",
-    parentShellId,
-    shellId: "shell-a",
-    destination: "host-a",
-    user: "alice",
-    host: "10.0.0.10",
-    port: 22,
-    controlPath: "/tmp/termia-a/control",
-    cwd: "/home/alice",
-  } satisfies SshOpenEvent);
-  await controller.readyWorkspace("shell-a");
-  consume.call(controller, {
-    type: "identityOpen",
-    parentShellId: "shell-a",
-    shellId: "shell-root",
-    user: "root",
-    cwd: "/root",
-    port: 45123,
-    hostKey: "ssh-ed25519 AAAA",
-  } satisfies IdentityOpenEvent);
-
-  const binding = await controller.readyWorkspace("shell-root");
-  assert.equal(workspaceUri(binding.target), "ssh://root@10.0.0.10/root");
-  assert.match(identities.privateKey ?? "", /^\/tmp\/termia-hooks-/);
-  consume.call(controller, { type: "ready", shellId: "shell-root", cwd: "/srv/root" });
-  assert.equal(controller.workspace.piCwd, "/tmp/mount-shell-root/srv/root");
-  consume.call(controller, { type: "sshClose", shellId: "shell-root" });
-  await new Promise<void>((resolveTick) => setImmediate(resolveTick));
-  assert.equal(workspaceUri(controller.workspace.target), "ssh://alice@10.0.0.10/home/alice");
-  assert.deepEqual(identities.closed, ["shell-root"]);
 });

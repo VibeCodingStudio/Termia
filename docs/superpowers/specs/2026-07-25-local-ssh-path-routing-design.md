@@ -28,6 +28,9 @@ exit to a parent before it becomes the active SSH workspace.
 home safely. Callers use a relative remote path, an `ssh://` absolute path, or
 a local absolute path instead.
 
+`file://` is not a Termia path form. Use the original local absolute path;
+reject other URI schemes instead of interpreting them as remote relative paths.
+
 ## Prompt Presentation
 
 - Continue presenting the active cwd as `ssh://user@host/path`.
@@ -73,6 +76,8 @@ synthetic tests.
 ## Errors
 
 - Reject malformed `ssh://` URIs.
+- Reject unsupported URI schemes such as `file://` with guidance to use a local
+  absolute path.
 - Reject an authority that differs from the active SSH leaf and report both the
   requested and active authorities.
 - Reject `ssh://` when no SSH workspace is active.

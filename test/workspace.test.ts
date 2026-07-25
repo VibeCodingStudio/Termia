@@ -97,11 +97,22 @@ test("leaves local bindings unchanged", () => {
 
 test("presents Pi's physical SSH cwd as the logical workspace", () => {
   const binding = sshWorkspace(hops, "/srv/app", "/tmp/mount-b");
+  const localSkill = "/home/klein/.pi/agent/npm/node_modules/demo/skills/local/SKILL.md";
+  const remoteSkill = "/tmp/mount-b/srv/app/.agents/skills/remote/SKILL.md";
   const prompt = presentWorkspaceCwd(
-    `You are an agent.\nCurrent working directory: ${binding.piCwd}`,
+    `Skills:\n${localSkill}\n${remoteSkill}\nCurrent working directory: ${binding.piCwd}`,
     binding,
+    [{ filePath: localSkill }, { filePath: remoteSkill }],
   );
 
   assert.match(prompt, /Current working directory: ssh:\/\/bob@10\.0\.0\.20:2222\/srv\/app/);
+  assert.match(prompt, /relative file paths use the active SSH cwd/i);
+  assert.match(prompt, /local absolute paths stay local/i);
+  assert.match(prompt, /remote absolute paths use ssh:\/\//i);
+  assert.ok(prompt.includes(localSkill));
+  assert.match(
+    prompt,
+    /ssh:\/\/bob@10\.0\.0\.20:2222\/srv\/app\/\.agents\/skills\/remote\/SKILL\.md/,
+  );
   assert.doesNotMatch(prompt, /\/tmp\/mount-b/);
 });

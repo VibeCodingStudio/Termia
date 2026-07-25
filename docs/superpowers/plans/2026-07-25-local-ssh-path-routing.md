@@ -155,7 +155,7 @@ git commit -m "fix: distinguish local and ssh paths"
 - Consumes: `before_agent_start.systemPrompt`, `systemPromptOptions.skills`, and the active binding.
 - Produces: A prompt containing a logical SSH cwd, concise path rules, untouched local skill paths, and logical `ssh://` remote skill paths.
 
-- [ ] **Step 1: Add failing prompt-presentation tests**
+- [x] **Step 1: Add failing prompt-presentation tests**
 
 Extend the existing prompt test in `test/workspace.test.ts`:
 
@@ -176,7 +176,7 @@ assert.match(prompt, /ssh:\/\/bob@10\.0\.0\.20:2222\/srv\/app\/\.agents\/skills\
 assert.doesNotMatch(prompt, /\/tmp\/mount-b/);
 ```
 
-- [ ] **Step 2: Run the prompt test and verify it fails**
+- [x] **Step 2: Run the prompt test and verify it fails**
 
 Run:
 
@@ -186,7 +186,7 @@ node --test test/workspace.test.ts
 
 Expected: `presentWorkspaceCwd()` does not yet accept skills, add guidance, or rewrite the mounted skill path.
 
-- [ ] **Step 3: Implement prompt presentation**
+- [x] **Step 3: Implement prompt presentation**
 
 Extend `presentWorkspaceCwd()` with an optional
 `readonly { filePath: string }[]` parameter. For SSH bindings:
@@ -198,7 +198,7 @@ Extend `presentWorkspaceCwd()` with an optional
 Update `extensions/termia/index.ts` to pass
 `event.systemPromptOptions.skills` into `presentWorkspaceCwd()`. Do not scan the filesystem or persist a skill allowlist.
 
-- [ ] **Step 4: Run focused and full verification**
+- [x] **Step 4: Run focused and full verification**
 
 Run:
 
@@ -211,7 +211,7 @@ git diff --check
 
 Expected: focused tests pass; the full suite reports zero failures; typecheck and whitespace checks succeed.
 
-- [ ] **Step 5: Commit prompt presentation**
+- [x] **Step 5: Commit prompt presentation**
 
 ```bash
 git add extensions/termia/workspace.ts extensions/termia/index.ts test/workspace.test.ts

@@ -26,6 +26,12 @@ const WORKSPACE_TOOLS = new Set([...FILE_TOOLS, "bash"]);
 const DISCONNECTED_REASON = "Termia SSH workspace is disconnected; run /termia to return to the nearest live workspace";
 const TILDE_REASON = "Termia cannot map ~ paths safely; use an absolute remote path";
 const URI_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+const SSH_PATH_GUIDANCE = [
+  "Termia SSH file paths:",
+  "- Relative file paths use the active SSH cwd.",
+  "- Local absolute paths stay local.",
+  "- Remote absolute paths use ssh://user@host/path.",
+].join("\n");
 
 export function fileWorkspace(path: string): WorkspaceBinding {
   const absolute = resolve(path);
@@ -134,12 +140,25 @@ export function projectWorkspacePath(binding: WorkspaceBinding, input: string): 
   return resolve(binding.mountRoot, `.${posix.resolve(binding.target.path, input)}`);
 }
 
-export function presentWorkspaceCwd(prompt: string, binding: WorkspaceBinding): string {
+export function presentWorkspaceCwd(
+  prompt: string,
+  binding: WorkspaceBinding,
+  skills: readonly { filePath: string }[] = [],
+): string {
   if (binding.target.scheme !== "ssh") return prompt;
+  if (binding.mountRoot === undefined) throw new Error("Termia SSH workspace has no mount root");
+  let presented = prompt;
+  for (const skill of skills) {
+    const location = relative(binding.mountRoot, resolve(skill.filePath));
+    if (location === ".." || location.startsWith(`..${sep}`) || isAbsolute(location)) continue;
+    const uri = new URL(workspaceUri(binding.target));
+    uri.pathname = `/${location.split(sep).join("/")}`;
+    presented = presented.replaceAll(skill.filePath, uri.href);
+  }
   const physicalCwd = binding.piCwd.replaceAll("\\", "/");
-  return prompt.replace(
+  return presented.replace(
     `Current working directory: ${physicalCwd}`,
-    `Current working directory: ${workspaceUri(binding.target)}`,
+    `${SSH_PATH_GUIDANCE}\nCurrent working directory: ${workspaceUri(binding.target)}`,
   );
 }
 

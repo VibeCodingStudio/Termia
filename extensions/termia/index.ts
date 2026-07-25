@@ -398,7 +398,13 @@ export default function termia(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event) => {
     if (!state.enabled || state.binding.target.scheme !== "ssh") return;
-    return { systemPrompt: presentWorkspaceCwd(event.systemPrompt, state.binding) };
+    return {
+      systemPrompt: presentWorkspaceCwd(
+        event.systemPrompt,
+        state.binding,
+        event.systemPromptOptions.skills,
+      ),
+    };
   });
 
   pi.on("agent_start", () => {

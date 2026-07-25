@@ -2,8 +2,7 @@
 
 ## Status
 
-Approved in conversation on 2026-07-26. This document is awaiting the written
-spec review gate before implementation planning.
+Approved in conversation and through written spec review on 2026-07-26.
 
 ## Goal
 

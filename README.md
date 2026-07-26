@@ -309,6 +309,11 @@ commands carefully.
 pi remove npm:@vibecodingstudio/termia
 ```
 
+## Community
+
+- [LINUX DO](https://linux.do/) — A friendly community for open technology
+  sharing and discussion.
+
 ## License
 
 MIT
